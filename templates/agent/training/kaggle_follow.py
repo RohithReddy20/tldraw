@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -492,17 +493,25 @@ def verify_native(directory):
             }
             if report["speech_fixture_used"]:
                 environment["VOICE_SMOKE_AUDIO"] = str(ROOT / "runs/voice-smoke.wav")
+            command = [
+                "pnpm",
+                "--filter",
+                "tldraw-agent",
+                "test:voice",
+                "--grep",
+                "model integration",
+                "--reporter=line,json",
+            ]
+            keep_awake = (
+                shutil.which("caffeinate") if sys.platform == "darwin" else None
+            )
+            report["idle_sleep_prevented"] = keep_awake is not None
+            if keep_awake:
+                # Idle sleep can expire browser timeouts while inference is suspended.
+                command = [keep_awake, "-i", *command]
             with (output / "browser.log").open("w") as browser_log:
                 result = subprocess.run(
-                    [
-                        "pnpm",
-                        "--filter",
-                        "tldraw-agent",
-                        "test:voice",
-                        "--grep",
-                        "model integration",
-                        "--reporter=line,json",
-                    ],
+                    command,
                     cwd=ROOT.parents[2],
                     env=environment,
                     stdout=browser_log,

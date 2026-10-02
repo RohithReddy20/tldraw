@@ -101,8 +101,11 @@ tokens and the longest response uses 92. The downloaded weights exactly match th
 final checkpoint, with verified dataset, task, and warm-start hashes. Validation
 stopped when a simulated manual drag targeted a shape the baseline had failed to
 create. The evaluator now retains that state mismatch without crashing; validation
-has restarted on `rohithresearch/canvas-270m-v5-validation` using the saved weights.
-Expanded-model accuracy remains pending. Four native browser tests pass. With the
+finished on `rohithresearch/canvas-270m-v5-validation` using the saved weights.
+Command validation accuracy is 88.42% raw and 87.75% with execution guards. Across
+480 closed-loop validation turns, exact action accuracy is 85.00% raw and 85.42%
+guarded; exact simulated state agreement is 19.58% in both modes. These results
+show that errors can carry into later edits. Four native browser tests pass. With the
 6,000-update model, the synthetic speech integration test passes, while the editing
 test fails at "Make it blue." Separate development probes also exposed failures
 for moving down, ungrouping, and redo; these probes are not a held-out benchmark.
@@ -112,8 +115,8 @@ and dataset/task hashes; it compares raw and guarded validation separately and
 preserves the fresh test set. Connection failures are retried within the monitor's
 13-hour runtime without restarting training.
 
-The next run, `rohithresearch/canvas-270m-v6-spoken-training`, is training for 2,000
-additional updates on two Tesla T4 GPUs. It starts from the verified 6,000-update
+The next run, `rohithresearch/canvas-270m-v6-spoken-training`, completed 2,000
+additional updates on two Tesla T4 GPUs. It started from the verified 6,000-update
 weights with a fresh optimizer and the profile `training/spoken-config.yaml`.
 Its 117,600 training examples comprise 48,000 spoken command variations, 48,000
 replayed examples, and 21,600 turns in 800 editing sessions. These sessions repeatedly
@@ -122,8 +125,14 @@ the original validation and test examples and sessions unchanged. Training artif
 stay under `training/runs/v6-spoken-workflow/`; remote run metadata and logs are under
 `training/runs/kaggle/spoken/`.
 
-After this run, the observer verifies the final checkpoint and runs the native model
-integration tests. A separate continuation waits for these tests to pass before
+The final checkpoint is downloaded and verified. Both native model integration tests
+pass: a 12-command editing session with manual dragging and undo/redo, and synthetic
+speech through Parakeet to a schema edit. The first attempt hit a transient browser
+helper error and an idle-sleep timeout; rerunning the unchanged tests with the Mac
+awake passed. The native check now prevents idle sleep only while its browser tests
+run. Broad accuracy for this refined model is still pending.
+
+A separate continuation waits for the native tests to pass before
 launching selected-model scoring on Kaggle: raw and guarded validation, plus guarded
 fresh tests covering 2,880 independent commands and 1,440 session turns. A failed
 native check leaves the fresh test set untouched. Final reports must match the same
