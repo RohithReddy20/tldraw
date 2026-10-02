@@ -15,6 +15,7 @@ import {
 import { ChatPanel } from './components/ChatPanel'
 import { ChatPanelFallback } from './components/ChatPanelFallback'
 import { CustomHelperButtons } from './components/CustomHelperButtons'
+import { LocalVoiceApp } from './local-voice/LocalVoiceApp'
 import { AgentHighlightOverlayUtil } from './overlays/AgentHighlightOverlayUtil'
 import { TargetAreaTool } from './tools/TargetAreaTool'
 import { TargetShapeTool } from './tools/TargetShapeTool'
@@ -51,7 +52,7 @@ const overrides: TLUiOverrides = {
 	},
 }
 
-function App() {
+function CloudAgentApp() {
 	const [app, setApp] = useState<TldrawAgentApp | null>(null)
 
 	const handleUnmount = useCallback(() => {
@@ -93,6 +94,14 @@ function App() {
 				</ErrorBoundary>
 			</div>
 		</TldrawUiToastsProvider>
+	)
+}
+
+function App() {
+	return new URLSearchParams(window.location.search).get('mode') === 'local-voice' ? (
+		<LocalVoiceApp />
+	) : (
+		<CloudAgentApp />
 	)
 }
 
