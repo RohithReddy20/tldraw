@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from actions import ACTION_MODELS, TOOLS, messages_for, parse_call, validate_call
 from build_workflow import build_workflow, call
@@ -192,6 +193,56 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     parse_call(tokenizer.decode(full[len(prompt) :]), canvas), action
                 )
+
+    def test_remote_results_reject_a_different_final_adapter(self):
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        from kaggle_follow import finish_workflow
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launch = {
+                "updates": 6000,
+                "dataset_sha256": "data",
+                "task_sha256": "task",
+                "warm_start_sha256": "weights",
+            }
+            (root / "run.json").write_text(json.dumps(launch))
+            download = root / "download"
+            checkpoint = download / "refinement/dual-window/adapter/checkpoints/0006000"
+            checkpoint.mkdir(parents=True)
+            (checkpoint / "progress.json").write_text(
+                json.dumps(
+                    {"step": 6000, "dataset_sha256": "data", "task_sha256": "task"}
+                )
+            )
+            (download / "refinement-training.json").write_text(
+                json.dumps(
+                    {
+                        **launch,
+                        "end_step": 6000,
+                        "initialization": "weights_only",
+                        "training_finite": True,
+                    }
+                )
+            )
+            saved = {"weight": np.asarray([1.0], dtype=np.float32)}
+            final = checkpoint.parent.parent / "adapters.safetensors"
+            save_file(saved, str(checkpoint / "adapters.safetensors"))
+            save_file({"weight": np.asarray([2.0], dtype=np.float32)}, str(final))
+            with (
+                patch("kaggle_follow.cli"),
+                patch("gpu_benchmark.quality_comparison", return_value={}) as compare,
+            ):
+                with self.assertRaisesRegex(ValueError, "weights differ"):
+                    finish_workflow("owner/kernel", root)
+                compare.assert_not_called()
+                save_file(saved, str(final))
+                finish_workflow("owner/kernel", root)
+            completed = json.loads((root / "run.json").read_text())
+            self.assertEqual(completed["status"], "complete")
+            self.assertFalse(completed["test_set_used"])
 
 
 if __name__ == "__main__":

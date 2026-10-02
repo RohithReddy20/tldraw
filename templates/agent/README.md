@@ -87,7 +87,23 @@ supported move, delete, styling, and undo commands as unsupported are excluded.
 The reproducible builder is `training/build_workflow.py`; generated artifacts stay
 under `training/runs/v5-general-canvas/`. Session state checks use a Python document
 simulation; they do not measure pixel layout or replace the native browser tests.
-Training and expanded-model accuracy verification remain pending.
+The private Kaggle run
+`rohithresearch/canvas-270m-v5-general-workflow` is active on two Tesla T4 GPUs.
+It targets 6,000 updates, batch eight, micro batch two per GPU, completion window
+160, and a 6,144-token limit. It starts from the retained 15,000-update adapter
+with a fresh optimizer. The checked-in profile is `training/workflow-config.yaml`.
+All generated calls passed round-trip checks; the longest example uses 4,330
+tokens and the longest response uses 92. Expanded-model accuracy remains pending.
+Run metadata and live output are `training/runs/kaggle/workflow/run.json` and
+`live.log`. The observer downloads results and verifies final checkpoint weights
+and dataset/task hashes; it compares raw and guarded validation separately and
+preserves the fresh test set. Reattach the observer with:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \
+  --kernel rohithresearch/canvas-270m-v5-general-workflow \
+  --workflow templates/agent/training/runs/kaggle/workflow
+```
 
 ## Local action-model training
 

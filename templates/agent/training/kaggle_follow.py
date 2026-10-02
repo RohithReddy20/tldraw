@@ -101,13 +101,89 @@ def finish(kernel):
     print(f"Fresh test reports saved to {run}.", flush=True)
 
 
+def finish_workflow(kernel, directory):
+    from gpu_benchmark import quality_comparison
+
+    download = directory / "download"
+    cli(
+        "kernels",
+        "output",
+        kernel,
+        "--path",
+        str(download),
+        "--file-pattern",
+        r"^refinement(?:/|-)",
+        "--page-size",
+        "200",
+        timeout=1200,
+    )
+    launch = json.loads((directory / "run.json").read_text())
+    candidate = download / "refinement/dual-window"
+    result = json.loads((download / "refinement-training.json").read_text())
+    for key, expected in (
+        ("end_step", launch["updates"]),
+        ("dataset_sha256", launch["dataset_sha256"]),
+        ("task_sha256", launch["task_sha256"]),
+        ("warm_start_sha256", launch["warm_start_sha256"]),
+        ("initialization", "weights_only"),
+    ):
+        if result[key] != expected:
+            raise ValueError(f"Downloaded workflow run differs in {key}.")
+    weights = candidate / "adapter/adapters.safetensors"
+    checkpoint = candidate / "adapter/checkpoints" / f"{launch['updates']:07d}"
+    progress = json.loads((checkpoint / "progress.json").read_text())
+    if progress["step"] != launch["updates"] or any(
+        progress[key] != launch[key] for key in ("dataset_sha256", "task_sha256")
+    ):
+        raise ValueError("Workflow adapter does not match its final checkpoint.")
+    import numpy as np
+    from safetensors.numpy import load_file
+
+    final = load_file(str(weights))
+    saved = load_file(str(checkpoint / "adapters.safetensors"))
+    if (
+        not result["training_finite"]
+        or final.keys() != saved.keys()
+        or not all(np.array_equal(values, saved[key]) for key, values in final.items())
+    ):
+        raise ValueError("Workflow weights differ from the completed checkpoint.")
+    reports = {
+        mode: quality_comparison(
+            download / "refinement/baseline", candidate, guarded=mode == "guarded"
+        )
+        for mode in ("raw", "guarded")
+    }
+    for report in reports.values():
+        report["scope"] = (
+            f"General workflow validation after {launch['updates']} updates; "
+            "native layout is verified separately in browser tests."
+        )
+    (directory / "verified-comparison.json").write_text(json.dumps(reports, indent=2))
+    launch.update(
+        status="complete",
+        downloaded_adapter=str(weights.parent),
+        verification="checkpoint weights, task, dataset and warm-start hashes match",
+        adapter_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
+        training=result,
+        validation=reports,
+        test_set_used=False,
+    )
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    print(
+        f"Verified the completed general workflow model. Reports: {directory}",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Retrieve and evaluate Kaggle training."
     )
     parser.add_argument("--kernel", required=True)
+    parser.add_argument("--workflow", type=Path)
     args = parser.parse_args()
-    OUTPUT.mkdir(parents=True, exist_ok=True)
+    output = args.workflow or OUTPUT
+    output.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 13 * 60 * 60
     failures = 0
     while time.monotonic() < deadline:
@@ -128,12 +204,15 @@ def main():
         state = match[1].split(".")[-1].lower()
         if state in ("complete", "error", "cancel_acknowledged", "cancelled"):
             log = cli("kernels", "logs", args.kernel)
-            (OUTPUT / "kernel.log").write_text(log)
+            (output / "kernel.log").write_text(log)
             if state != "complete":
                 raise RuntimeError(
-                    f"Kaggle training failed; see {OUTPUT / 'kernel.log'}"
+                    f"Kaggle training failed; see {output / 'kernel.log'}"
                 )
-            finish(args.kernel)
+            if args.workflow:
+                finish_workflow(args.kernel, args.workflow)
+            else:
+                finish(args.kernel)
             return
         time.sleep(60)
     raise TimeoutError("Kaggle training exceeded its supervised runtime.")
