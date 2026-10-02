@@ -28,7 +28,14 @@ def training_row(example):
 
 
 def read_examples(path=ROOT / "examples.jsonl"):
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return list(iter_examples(path))
+
+
+def iter_examples(path=ROOT / "examples.jsonl"):
+    with path.open() as source:
+        for line in source:
+            if line.strip():
+                yield json.loads(line)
 
 
 def dataset_hash():
@@ -67,13 +74,14 @@ def audit_examples(examples):
     return dict(counts)
 
 
-def prepare_data():
+def prepare_data(*, write_rows=True):
     examples = read_examples()
     counts = audit_examples(examples)
     DATA.mkdir(exist_ok=True)
-    for split in ("train", "valid", "test"):
-        rows = [training_row(e) for e in examples if e["split"] == split]
-        (DATA / f"{split}.jsonl").write_text(
-            "".join(json.dumps(row) + "\n" for row in rows)
-        )
+    if write_rows:
+        for split in ("train", "valid", "test"):
+            with (DATA / f"{split}.jsonl").open("w") as output:
+                for example in examples:
+                    if example["split"] == split:
+                        output.write(json.dumps(training_row(example)) + "\n")
     return counts

@@ -54,7 +54,8 @@ remove one, rename the box, or connect it to another schema. Successful edits
 select their target; the next command can refer to that selection. Current schema
 contents, the last three outcomes, and stable last-created/last-edited IDs go to
 the model on each request. Canvas contents persist locally; outcome memory resets
-on page reload. Other tldraw shape types are excluded from the model's context.
+on page reload. General drawing shapes, groups, geometry, styles, selection, camera,
+and available undo/redo history are now included in the model context.
 
 The service validates every function call. The browser checks target IDs, field
 existence, limits, and whether the canvas changed before applying an edit. One edit
@@ -63,11 +64,30 @@ guards reject known duplicate-name, deleted-reference, and compound-edit failure
 patterns; these guards do not change the raw model benchmark scores. They do not
 guarantee that every misunderstanding is caught. Audio conversion files are temporary.
 
-This is a prototype with six actions. Adding/removing methods, arbitrary styling,
-undo by voice, and multiple edits in one utterance are not supported. There are at
-most 30 schema boxes and 30 fields or methods per box, and the service rejects
-prompts that exceed its 2,048-token budget. The current adapter still makes errors
-in long sessions; see the validation results below.
+The executor now accepts 18 tools covering shape and text creation, selection,
+movement, resizing, deletion, text replacement, color/fill/opacity, duplication,
+grouping, layer order, alignment, distribution, flipping, stacking, packing,
+undo/redo, pan/zoom, schema properties/methods, and bound arrow connections.
+Text height and note dimensions follow tldraw's layout constraints. Each request
+still produces one action; compound edits are rejected. There are at most 30 schema
+boxes, 60 other shapes, and 30 properties or methods per box. The expanded prompt
+budget is 6,144 tokens, including a 256-token response allowance.
+
+The retained 15,000-update adapter was trained on the earlier six-tool contract.
+Its reported accuracy does not establish accuracy on the expanded tools. Three
+Playwright tests verify the native editor workflows, including nested group movement,
+bound-arrow cleanup, redo preservation, and atomic rejection of stale or missing
+targets. Run them with `pnpm --filter tldraw-agent test:voice`.
+
+The general-workflow training set contains 329,213 training examples, including
+4,000 editing sessions of 24–80 turns, 24,000 compound-request counterexamples, and
+6,000 corrected requests. It preserves 1,200 validation examples and 2,880 test
+examples, including 12 validation and 24 test sessions. Earlier labels marking
+supported move, delete, styling, and undo commands as unsupported are excluded.
+The reproducible builder is `training/build_workflow.py`; generated artifacts stay
+under `training/runs/v5-general-canvas/`. Session state checks use a Python document
+simulation; they do not measure pixel layout or replace the native browser tests.
+Training and expanded-model accuracy verification remain pending.
 
 ## Local action-model training
 

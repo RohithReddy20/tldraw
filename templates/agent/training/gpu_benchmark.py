@@ -234,8 +234,20 @@ def worker(root, output, case, verify=False, quality=False):
             return original_all_sum(*args, **kwargs)
 
         mx.distributed.all_sum = gpu_all_sum
-    accumulation = 8 // (settings["micro"] * workers)
     config = yaml.safe_load((root / "config.yaml").read_text())
+    if quality and (root / "warm-start.json").exists():
+        settings = {
+            **settings,
+            "micro": config.get("refinement_micro_batch", settings["micro"]),
+        }
+    accumulation = 8 // (settings["micro"] * workers)
+    if accumulation < 1 or settings["micro"] * workers * accumulation != 8:
+        raise ValueError("Micro batches must preserve global batch eight.")
+    if quality:
+        from lab import verify_token_cache
+
+        if not verify_token_cache(config):
+            raise ValueError("A verified token cache is required for GPU experiments.")
     model, _ = load(model_path("float16"))
     model.freeze()
     linear_to_lora_layers(model, config["num_layers"], config["lora_parameters"])
@@ -291,7 +303,7 @@ def worker(root, output, case, verify=False, quality=False):
         value, count = (
             packed_completion_loss(model, *data)
             if settings["packed"]
-            else completion_loss(model, *data, 96)
+            else completion_loss(model, *data, config.get("completion_window", 96))
         )
         return value * weight, count
 
@@ -397,7 +409,7 @@ def worker(root, output, case, verify=False, quality=False):
             steps_per_report=interval * accumulation,
             steps_per_save=10000,
             adapter_file=str(adapter_file),
-            max_seq_length=2048,
+            max_seq_length=config["max_seq_length"],
         ),
         loss=loss,
         iterate_batches=iterator,
@@ -562,9 +574,14 @@ def run_case(root, output, case, verify=False, quality=False):
         command.append("--verify")
     if quality:
         command.append("--quality")
-    timeout = (
-        1800 if quality else (600 if verify or CASES[case].get("compile") else 360)
-    )
+    if quality:
+        import yaml
+
+        timeout = yaml.safe_load((root / "config.yaml").read_text()).get(
+            "quality_timeout_seconds", 1800
+        )
+    else:
+        timeout = 600 if verify or CASES[case].get("compile") else 360
     print(f"Benchmarking {folder.name}; maximum {timeout} seconds.", flush=True)
     workers = CASES[case]["workers"]
     handles, processes = [], []

@@ -29,6 +29,7 @@
 		"build": "vite build",
 		"dev": "vite --host",
 		"preview": "vite preview",
+		"test:voice": "playwright test --config e2e/playwright.config.ts",
 		"lint": "pnpm exec tsx ../../internal/scripts/lint.ts"
 	},
 	"dependencies": {
@@ -50,6 +51,7 @@
 		"zod": "^4.1.8"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.61.0",
 		"@cloudflare/workers-types": "^4.20260302.0",
 		"@types/react": "^19.2.7",
 		"@types/react-dom": "^19.2.3",

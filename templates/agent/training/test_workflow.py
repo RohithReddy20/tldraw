@@ -1,0 +1,198 @@
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from actions import ACTION_MODELS, TOOLS, messages_for, parse_call, validate_call
+from build_workflow import build_workflow, call
+from dataset import audit_examples, training_row
+from sessions import CanvasSession
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.canvas = {
+            "schemas": [{"id": "box", "name": "User", "methods": ["getName"]}],
+            "shapes": [
+                {"id": "a", "name": "Class", "kind": "rectangle"},
+                {"id": "b", "name": "Subject", "kind": "ellipse", "x": 300.0},
+            ],
+            "selected_ids": ["a", "b"],
+        }
+
+    def test_array_aliases_and_optional_coordinates_round_trip(self):
+        text = (
+            "<start_function_call>call:move_shapes{shape_ids:[<escape>shape1<escape>,"
+            "<escape>shape2<escape>],dx:-100,dy:50}<end_function_call>"
+        )
+        self.assertEqual(
+            parse_call(text, self.canvas),
+            call("move_shapes", shape_ids=["a", "b"], dx=-100.0, dy=50.0),
+        )
+        text = (
+            "<start_function_call>call:create_shape{kind:<escape>rectangle<escape>,"
+            "text:<escape><escape>,x:None,y:None,width:160,height:100}"
+            "<end_function_call>"
+        )
+        self.assertEqual(parse_call(text, self.canvas)["arguments"]["x"], None)
+
+    def test_delete_undo_redo_and_selection_keep_actual_references(self):
+        session = CanvasSession(self.canvas)
+        session.execute(
+            "Move them.",
+            call("move_shapes", shape_ids=["a", "b"], dx=100.0, dy=50.0),
+            "unused",
+        )
+        session.execute(
+            "Delete Class.", call("delete_shapes", shape_ids=["a"]), "unused"
+        )
+        self.assertNotIn("a", session.objects())
+        session.execute("Undo.", call("canvas_command", operation="undo"), "unused")
+        self.assertEqual(session.objects()["a"]["x"], 100)
+        session.execute(
+            "Select Subject.", call("select_shapes", shape_ids=["b"]), "unused"
+        )
+        self.assertTrue(session.canvas["can_redo"])
+        session.execute("Redo.", call("canvas_command", operation="redo"), "unused")
+        self.assertNotIn("a", session.objects())
+        session.execute(
+            "Add a method.",
+            call("add_method", schema_id="box", method_name="getClass"),
+            "unused",
+        )
+        session.execute("Undo.", call("canvas_command", operation="undo"), "unused")
+        self.assertEqual(session.objects()["box"]["methods"], ["getName"])
+
+    def test_group_parent_alias_and_failed_action_are_consistent(self):
+        session = CanvasSession(self.canvas)
+        session.execute(
+            "Group them.",
+            call("arrange_shapes", shape_ids=["a", "b"], operation="group"),
+            "group",
+        )
+        self.assertIn(
+            '"parent_id": "shape3"',
+            messages_for("Move the group.", session.canvas)[1]["content"],
+        )
+        before = session.snapshot()
+        with self.assertRaises(ValueError):
+            session.execute(
+                "Move a missing shape.",
+                call("move_shapes", shape_ids=["a", "missing"], dx=100.0, dy=0.0),
+                "unused",
+            )
+        self.assertEqual(before, session.snapshot())
+        session.execute(
+            "Move the group.",
+            call("move_shapes", shape_ids=["group", "a"], dx=100.0, dy=0.0),
+            "unused",
+        )
+        self.assertEqual(session.objects()["a"]["x"], 100)
+
+    def test_new_data_removes_obsolete_labels_and_keeps_split_groups_separate(self):
+        original = [
+            {
+                "id": "obsolete",
+                "group": "obsolete",
+                "split": "train",
+                "command": "Move User to the left.",
+                "canvas": {},
+                "expected": call("no_action", reason="unsupported_request"),
+            },
+            {
+                "id": "keep",
+                "group": "keep",
+                "split": "train",
+                "command": "Explain User.",
+                "canvas": {},
+                "expected": call("no_action", reason="unsupported_request"),
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in original))
+            rows, cases = build_workflow(path, independent=1000, sessions=10, replay=10)
+        audit_examples(rows)
+        self.assertNotIn("obsolete", {row["id"] for row in rows})
+        self.assertIn("keep", {row["id"] for row in rows})
+        self.assertEqual(set(ACTION_MODELS), {row["expected"]["name"] for row in rows})
+        self.assertTrue(all(24 <= len(case["turns"]) <= 80 for case in cases))
+
+    def test_cached_tool_prefix_matches_the_official_template_for_every_tool(self):
+        from huggingface_hub import hf_hub_download
+        from transformers import AutoTokenizer
+
+        from lab import MODEL, REVISION, ToolPrefixEncoder
+
+        try:
+            checkpoint = Path(
+                hf_hub_download(
+                    MODEL,
+                    "tokenizer_config.json",
+                    revision=REVISION,
+                    local_files_only=True,
+                )
+            ).parent
+        except FileNotFoundError:
+            self.skipTest("Pinned tokenizer is not cached.")
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        encoder = ToolPrefixEncoder(tokenizer)
+        examples = [
+            call(
+                "create_schema_box", name="User", fields=["name"], methods=["getName"]
+            ),
+            call("add_property", schema_id="box", property_name="email"),
+            call("remove_property", schema_id="box", property_name="name"),
+            call("rename_schema", schema_id="box", new_name="Member"),
+            call("connect_schemas", source_id="box", target_id="a", label="owns"),
+            call("no_action", reason="ambiguous_target"),
+            call("create_shape", kind="text", text="Class", x=None, y=None),
+            call("select_shapes", shape_ids=["a", "b"]),
+            call("move_shapes", shape_ids=["a", "b"], dx=-100.0, dy=50.0),
+            call("delete_shapes", shape_ids=["a"]),
+            call("resize_shape", shape_id="a", width=400.0, height=300.0),
+            call("set_text", shape_id="a", text="New label"),
+            call("style_shapes", shape_ids=["a"], color="red", fill=None, opacity=None),
+            call("arrange_shapes", shape_ids=["a", "b"], operation="group"),
+            call("canvas_command", operation="zoom_in"),
+            call("pan_canvas", dx=100.0, dy=-50.0),
+            call("add_method", schema_id="box", method_name="getClass"),
+            call("remove_method", schema_id="box", method_name="getName"),
+        ]
+        canvas = copy.deepcopy(self.canvas)
+        canvas["schemas"][0]["properties"] = ["name"]
+        for action in examples:
+            action = validate_call(action, canvas)
+            row = training_row(
+                {
+                    "command": "Quoted label, brackets [v2], apostrophe's.",
+                    "canvas": canvas,
+                    "expected": action,
+                }
+            )
+            with self.subTest(tool=action["name"]):
+                full = encoder.encode(row["messages"])
+                prompt = encoder.encode(row["messages"][:-1], generation=True)
+                self.assertEqual(
+                    full,
+                    tokenizer.apply_chat_template(
+                        row["messages"], tools=TOOLS, return_dict=False
+                    ),
+                )
+                self.assertEqual(
+                    prompt,
+                    tokenizer.apply_chat_template(
+                        row["messages"][:-1],
+                        tools=TOOLS,
+                        add_generation_prompt=True,
+                        return_dict=False,
+                    ),
+                )
+                self.assertEqual(
+                    parse_call(tokenizer.decode(full[len(prompt) :]), canvas), action
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

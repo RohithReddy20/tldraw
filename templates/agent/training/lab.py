@@ -22,7 +22,15 @@ from actions import (
     no_action,
     parse_call,
 )
-from dataset import DATA, ROOT, dataset_hash, prepare_data, read_examples, training_row
+from dataset import (
+    DATA,
+    ROOT,
+    dataset_hash,
+    iter_examples,
+    prepare_data,
+    read_examples,
+    training_row,
+)
 
 MODEL = "mlx-community/functiongemma-270m-it-bf16"
 REVISION = "bb327a9ad61044e1496a2bee2365a6b6a6684c72"
@@ -85,64 +93,110 @@ def inspect_data():
 
 
 def check_tokenization(tokenizer, max_length=None, *, cache=False):
+    import tempfile
+    from contextlib import ExitStack
+
     import numpy as np
 
     lengths = []
-    encoded = {split: [] for split in ("train", "valid", "test")}
-    offsets = {split: [] for split in encoded}
+    offsets = {split: [] for split in ("train", "valid", "test")}
+    sizes = {split: [] for split in offsets}
     max_completion = 0
-    for index, example in enumerate(read_examples()):
-        row = training_row(example)
-        full = tokenizer.apply_chat_template(
-            row["messages"], tools=TOOLS, return_dict=False
-        )
-        prompt = tokenizer.apply_chat_template(
-            row["messages"][:-1],
-            tools=TOOLS,
-            add_generation_prompt=True,
-            return_dict=False,
-        )
-        if full[: len(prompt)] != prompt:
-            raise ValueError(f"Prompt masking mismatch: {example['id']}")
-        completion = tokenizer.decode(full[len(prompt) :])
-        if parse_call(completion, example["canvas"]) != example["expected"]:
-            raise ValueError(f"Function-call round trip failed: {example['id']}")
-        if max_length is not None and len(full) > max_length:
-            raise ValueError(
-                f"{example['id']} exceeds the sequence limit; increase max_seq_length."
-            )
-        lengths.append(len(full))
-        max_completion = max(max_completion, len(full) - len(prompt))
+    encoder = ToolPrefixEncoder(tokenizer)
+    with ExitStack() as resources:
         if cache:
-            encoded[example["split"]].append(np.asarray(full, dtype=np.int32))
-            offsets[example["split"]].append(len(prompt))
-        if cache and (index + 1) % 20000 == 0:
-            print(f"Validated and tokenized {index + 1} examples.", flush=True)
-    if cache:
-        files = {}
-        for split, arrays in encoded.items():
-            output = DATA / f"tokens-{split}.npz"
-            boundaries = np.concatenate(([0], np.cumsum([len(a) for a in arrays])))
-            np.savez_compressed(
-                output,
-                tokens=np.concatenate(arrays),
-                boundaries=boundaries,
-                offsets=np.asarray(offsets[split], dtype=np.int32),
+            DATA.mkdir(exist_ok=True)
+            directory = Path(
+                resources.enter_context(tempfile.TemporaryDirectory(dir=DATA))
             )
-            files[output.name] = hashlib.sha256(output.read_bytes()).hexdigest()
-        (DATA / "tokens.json").write_text(
-            json.dumps(
-                {
-                    "dataset_sha256": dataset_hash(),
-                    "task_sha256": _task_hash(),
-                    "max_tokens": max(lengths),
-                    "max_completion_tokens": max_completion,
-                    "files": files,
-                },
-                indent=2,
+            streams = {
+                split: resources.enter_context((directory / split).open("wb"))
+                for split in offsets
+            }
+        for index, example in enumerate(iter_examples()):
+            row = training_row(example)
+            full = encoder.encode(row["messages"])
+            prompt = encoder.encode(row["messages"][:-1], generation=True)
+            if index < len(TOOLS):
+                for messages, tokens, generation in (
+                    (row["messages"], full, False),
+                    (row["messages"][:-1], prompt, True),
+                ):
+                    reference = tokenizer.apply_chat_template(
+                        messages,
+                        tools=TOOLS,
+                        add_generation_prompt=generation,
+                        return_dict=False,
+                    )
+                    if tokens != reference:
+                        raise ValueError(
+                            "Cached tool prefix changes the training tokens."
+                        )
+            if full[: len(prompt)] != prompt:
+                raise ValueError(f"Prompt masking mismatch: {example['id']}")
+            completion = tokenizer.decode(full[len(prompt) :])
+            if parse_call(completion, example["canvas"]) != example["expected"]:
+                raise ValueError(f"Function-call round trip failed: {example['id']}")
+            if max_length is not None and len(full) > max_length:
+                raise ValueError(
+                    f"{example['id']} exceeds the sequence limit; "
+                    "increase max_seq_length."
+                )
+            lengths.append(len(full))
+            max_completion = max(max_completion, len(full) - len(prompt))
+            if cache:
+                split = example["split"]
+                streams[split].write(np.asarray(full, dtype=np.int32).tobytes())
+                sizes[split].append(len(full))
+                offsets[split].append(len(prompt))
+            if cache and (index + 1) % 20000 == 0:
+                print(f"Validated and tokenized {index + 1} examples.", flush=True)
+        if cache:
+            files = {}
+            for split, stream in streams.items():
+                stream.flush()
+                output = DATA / f"tokens-{split}.npz"
+                tokens = np.memmap(directory / split, dtype=np.int32, mode="r")
+                np.savez_compressed(
+                    output,
+                    tokens=tokens,
+                    boundaries=np.concatenate(([0], np.cumsum(sizes[split]))),
+                    offsets=np.asarray(offsets[split], dtype=np.int32),
+                )
+                del tokens
+                files[output.name] = hashlib.sha256(output.read_bytes()).hexdigest()
+            (DATA / "tokens.json").write_text(
+                json.dumps(
+                    {
+                        "dataset_sha256": dataset_hash(),
+                        "task_sha256": _task_hash(),
+                        "max_tokens": max(lengths),
+                        "max_completion_tokens": max_completion,
+                        "files": files,
+                    },
+                    indent=2,
+                )
             )
-        )
     return lengths
+
+
+class ToolPrefixEncoder:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.prefix = None
+
+    def encode(self, messages, *, generation=False):
+        if self.prefix is None:
+            rendered = self.tokenizer.apply_chat_template(
+                messages, tools=TOOLS, tokenize=False, add_generation_prompt=generation
+            )
+            prefix = rendered.split("<start_of_turn>user\n", 1)[0]
+            self.prefix = self.tokenizer.encode(prefix, add_special_tokens=False)
+        body = self.tokenizer.apply_chat_template(
+            messages[1:], tokenize=False, add_generation_prompt=generation
+        ).removeprefix(self.tokenizer.bos_token)
+        # The special turn token prevents subword merges across the cached boundary.
+        return self.prefix + self.tokenizer.encode(body, add_special_tokens=False)
 
 
 def _task_hash():
@@ -306,7 +360,7 @@ def _metadata():
 def bundle_colab(resume=None, *, warm_start=None):
     if resume is not None and warm_start is not None:
         raise ValueError("Choose an exact resume or a new run from adapter weights.")
-    prepare_data()
+    prepare_data(write_rows=False)
     output = ROOT / "runs" / "canvas-training.zip"
     output.parent.mkdir(parents=True, exist_ok=True)
     files = [
@@ -420,7 +474,11 @@ def predict(
     if guarded:
         result["raw_prediction"] = result["prediction"]
         result["raw_error"] = result["error"]
-        if result["error"] == "Cannot remove a property that does not exist.":
+        if result["error"] in (
+            "Cannot remove a property that does not exist.",
+            "Cannot remove a method that does not exist.",
+            "No canvas history is available for that operation.",
+        ):
             result["prediction"] = no_action("missing_target")
             result["error"] = None
         if result["prediction"] is not None:
@@ -431,7 +489,7 @@ def predict(
 
 
 def evaluate(args):
-    prepare_data()
+    prepare_data(write_rows=False)
     model, tokenizer = load_model(args.adapter)
     examples = [e for e in read_examples() if e["split"] == args.split]
     if args.limit:

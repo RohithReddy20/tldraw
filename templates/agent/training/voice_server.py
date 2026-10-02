@@ -124,7 +124,7 @@ class VoiceEngine:
                 add_generation_prompt=True,
                 tokenize=True,
             )
-            if len(tokens) > 1792:
+            if len(tokens) > 5888:
                 raise ValueError("Canvas context is too large for the current demo.")
             result = predict(
                 self.model,

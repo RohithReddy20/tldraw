@@ -216,9 +216,7 @@ export function LocalVoiceApp() {
 	return (
 		<main className="local-voice-app">
 			<header className="voice-header">
-				<h1>
-					Voice canvas<span> / schema studio</span>
-				</h1>
+				<h1>Voice canvas</h1>
 				<div className="voice-service" data-online={online}>
 					<span />
 					{online ? 'Local service ready' : 'Local service offline'}
