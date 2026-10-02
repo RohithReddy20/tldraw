@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ from actions import (
     parse_call,
     validate_call,
 )
-from build_workflow import build_workflow, call
+from build_workflow import build_spoken_refinement, build_workflow, call
 from dataset import audit_examples, training_row
 from sessions import CanvasSession
 
@@ -115,6 +116,92 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotEqual(actual.snapshot(), oracle.snapshot())
         self.assertEqual(oracle.objects()["created"]["x"], 135)
         self.assertEqual(oracle.objects()["created"]["text"], "Course")
+
+    def test_spoken_refinement_keeps_evaluation_frozen_and_teaches_vertical_motion(
+        self,
+    ):
+        canvas = CanvasSession(
+            {
+                "shapes": [{"id": "group", "name": "Group", "kind": "group"}],
+                "selected_ids": ["group"],
+                "can_redo": True,
+            }
+        ).canvas
+        actions = [
+            call("move_shapes", shape_ids=["group"], dx=100, dy=0),
+            call(
+                "style_shapes",
+                shape_ids=["group"],
+                color="blue",
+                fill=None,
+                opacity=None,
+            ),
+            call("arrange_shapes", shape_ids=["group"], operation="ungroup"),
+            call("canvas_command", operation="redo"),
+        ]
+        original = [
+            {
+                "id": f"source-{i}",
+                "group": f"source-{i}",
+                "split": "train",
+                "command": f"Original instruction {i}.",
+                "canvas": canvas,
+                "expected": action,
+            }
+            for i, action in enumerate(actions)
+        ]
+        held_out = {
+            "id": "held-out",
+            "group": "held-out",
+            "split": "test",
+            "command": "Explain this untouched drawing.",
+            "canvas": {},
+            "expected": call("no_action", reason="unsupported_request"),
+        }
+        validation = {
+            **held_out,
+            "id": "validation",
+            "group": "validation",
+            "split": "valid",
+            "command": "Explain the validation drawing.",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "examples.jsonl"
+            source.write_text(
+                "".join(
+                    json.dumps(row) + "\n" for row in [*original, validation, held_out]
+                )
+            )
+            sessions = '[{"id":"frozen-session"}]\n'
+            (root / "sessions.jsonl").write_text(sessions)
+            output = root / "spoken"
+            build_spoken_refinement(
+                source, output, count=200, replay=4, seed=65, practice_sessions=0
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "examples.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [row for row in rows if row["split"] == "test"], [held_out]
+            )
+            self.assertEqual((output / "sessions.jsonl").read_text(), sessions)
+        spoken = [row for row in rows if row["id"].startswith("spoken-train-")]
+        self.assertEqual(len(spoken), 200)
+        self.assertTrue(any(row["command"].startswith("Make ") for row in spoken))
+        for direction, sign in (("up", -1), ("down", 1)):
+            moves = [
+                row
+                for row in spoken
+                if row["expected"]["name"] == "move_shapes"
+                and re.search(rf"\b{direction}\b", row["command"])
+            ]
+            self.assertTrue(moves)
+            for row in moves:
+                args = row["expected"]["arguments"]
+                self.assertEqual(args["dx"], 0)
+                self.assertGreater(args["dy"] * sign, 0)
 
     def test_group_parent_alias_and_failed_action_are_consistent(self):
         session = CanvasSession(self.canvas)

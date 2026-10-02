@@ -308,9 +308,12 @@ def main():
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--workflow", type=Path)
     parser.add_argument("--native-check", action="store_true")
+    parser.add_argument("--training-only", action="store_true")
     args = parser.parse_args()
     if args.native_check and not args.workflow:
         parser.error("--native-check requires --workflow.")
+    if args.training_only and not args.workflow:
+        parser.error("--training-only requires --workflow.")
     output = args.workflow or OUTPUT
     output.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 13 * 60 * 60
@@ -345,7 +348,10 @@ def main():
                         f"recovered. See {output / 'kernel.log'}"
                     )
                 if args.workflow:
-                    finish_workflow(args.kernel, args.workflow)
+                    if args.training_only:
+                        finish_workflow(args.kernel, args.workflow, training_only=True)
+                    else:
+                        finish_workflow(args.kernel, args.workflow)
                 else:
                     finish(args.kernel)
             except subprocess.SubprocessError as error:

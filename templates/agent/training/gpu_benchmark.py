@@ -789,7 +789,7 @@ def quality_comparison(baseline, candidate, *, guarded=False):
     return result
 
 
-def refinement_experiment(root, working):
+def refinement_experiment(root, working, *, training_only=False):
     import yaml
 
     if not (root / "warm-start.json").exists():
@@ -813,6 +813,12 @@ def refinement_experiment(root, working):
         raise RuntimeError(
             "Refinement training failed; the original adapter is retained."
         )
+    if training_only:
+        print(
+            "Refinement training complete; checkpoint ready for native checks.",
+            flush=True,
+        )
+        return
     evaluate_pair(root, output)
     result = {
         "raw": quality_comparison(baseline, output / "dual-window"),

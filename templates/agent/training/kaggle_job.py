@@ -54,14 +54,16 @@ def main():
     parser.add_argument("--train", action="store_true")
     parser.add_argument(
         "--task",
-        choices=("train", "benchmark", "quality", "refine", "evaluate"),
+        choices=("train", "benchmark", "quality", "refine", "refine-train", "evaluate"),
         default=globals().get("TASK", "train"),
     )
     args = parser.parse_args()
     os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "4096"
     # Production resumes on one T4; experiments can measure both allocated devices.
     os.environ["CUDA_VISIBLE_DEVICES"] = (
-        "0,1" if args.task in ("benchmark", "quality", "refine", "evaluate") else "0"
+        "0,1"
+        if args.task in ("benchmark", "quality", "refine", "refine-train", "evaluate")
+        else "0"
     )
     working = Path("/kaggle/working")
     root = working / "canvas-training"
@@ -83,10 +85,12 @@ def main():
             from gpu_benchmark import quality_experiment
 
             quality_experiment(root, working)
-        elif args.task == "refine":
+        elif args.task in ("refine", "refine-train"):
             from gpu_benchmark import refinement_experiment
 
-            refinement_experiment(root, working)
+            refinement_experiment(
+                root, working, training_only=args.task == "refine-train"
+            )
         elif args.task == "evaluate":
             from gpu_benchmark import resume_refinement_evaluation
 

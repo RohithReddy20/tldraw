@@ -6,8 +6,15 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from actions import Canvas, CanvasShape, SchemaBox, no_action, validate_call
-from dataset import audit_examples, read_examples
+from actions import (
+    Canvas,
+    CanvasShape,
+    SchemaBox,
+    messages_for,
+    no_action,
+    validate_call,
+)
+from dataset import audit_examples, iter_examples, read_examples
 from sessions import CanvasSession
 
 NAMES = {
@@ -702,6 +709,312 @@ def augment_rows(rows, seed, compounds=24000, corrections=6000):
     return [*rows, *extra]
 
 
+def spoken_instruction(row, rng):
+    action = copy.deepcopy(row["expected"])
+    name, args = action["name"], action["arguments"]
+    if name == "canvas_command":
+        phrases = {
+            "undo": [
+                "Undo.",
+                "Undo that.",
+                "Go back one step.",
+                "Cancel my last edit.",
+            ],
+            "redo": [
+                "Redo.",
+                "Redo that.",
+                "Put that change back.",
+                "Do the undone action again.",
+            ],
+            "select_all": ["Select all.", "Select everything.", "Select every shape."],
+            "clear_selection": ["Deselect.", "Clear selection.", "Select nothing."],
+            "zoom_in": ["Zoom in.", "Zoom in a bit.", "Make the view closer."],
+            "zoom_out": ["Zoom out.", "Zoom out a bit.", "Make the view wider."],
+            "zoom_to_fit": [
+                "Fit the drawing.",
+                "Show everything.",
+                "Zoom to fit all shapes.",
+            ],
+            "reset_zoom": [
+                "Reset the zoom.",
+                "Reset zoom.",
+                "Zoom to one hundred percent.",
+            ],
+        }
+        return rng.choice(phrases[args["operation"]]), action
+    ids = args["shape_ids"]
+    canvas, history = row["canvas"], row.get("history", {})
+    objects = {
+        shape["id"]: shape for shape in [*canvas["schemas"], *canvas.get("shapes", [])]
+    }
+    references = []
+    if canvas["selected_ids"] == ids:
+        references.extend(
+            ["it", "that one", "the selected shape", "this shape"]
+            if len(ids) == 1
+            else ["them", "the selected shapes", "these shapes", "the selection"]
+        )
+    if len(ids) == 1:
+        for kind in ("created", "edited"):
+            if history.get(f"last_{kind}_id") == ids[0]:
+                references.append(f"the last {kind} shape")
+    if all(
+        sum(
+            shape["name"].casefold() == objects[target]["name"].casefold()
+            for shape in objects.values()
+        )
+        == 1
+        for target in ids
+    ):
+        references.append(
+            " and ".join(json.dumps(objects[target]["name"]) for target in ids)
+        )
+    if not references:
+        return None
+    target = rng.choice(references)
+    if name == "move_shapes":
+        direction = rng.choice(["left", "right", "up", "down"])
+        distance = rng.choice([10, 25, 35, 40, 50, 75, 80, 100, 125, 200])
+        args.update(
+            dx=-distance
+            if direction == "left"
+            else distance
+            if direction == "right"
+            else 0,
+            dy=-distance
+            if direction == "up"
+            else distance
+            if direction == "down"
+            else 0,
+        )
+        command = rng.choice(
+            [
+                f"Move {target} {direction} by {distance}.",
+                f"Move {target} {distance} pixels {direction}.",
+                f"Shift {target} {direction} {distance} units.",
+                f"Nudge {target} {direction} by {distance}.",
+                f"Drag {target} {direction} {distance} pixels.",
+            ]
+        )
+    elif name == "style_shapes":
+        color = args["color"]
+        command = rng.choice(
+            [
+                f"Make {target} {color}.",
+                f"Color {target} {color}.",
+                f"Paint {target} {color}.",
+                f"Set {target} to {color}.",
+                f"Change the color of {target} to {color}.",
+                f"Turn {target} {color}.",
+            ]
+        )
+    else:
+        operation = args["operation"]
+        command = rng.choice(
+            {
+                "group": [
+                    f"Group {target}.",
+                    f"Put {target} in a group.",
+                    f"Group {target} together.",
+                ],
+                "ungroup": [
+                    f"Ungroup {target}.",
+                    f"Break {target} out of the group.",
+                    f"Remove the grouping from {target}.",
+                ],
+                "duplicate": [
+                    f"Duplicate {target}.",
+                    f"Make a copy of {target}.",
+                    f"Copy {target}.",
+                ],
+            }[operation]
+        )
+    return command, validate_call(action, canvas)
+
+
+def workflow_practice(rng, index):
+    group = f"spoken-session-{index}"
+    initial = initial_canvas(rng, "train", group, count=3)
+    targets = [shape["id"] for shape in initial["shapes"]]
+    initial["selected_ids"] = targets
+    session = CanvasSession(initial)
+    rows, turns = [], []
+    for cycle in range(3):
+        group_id = f"{group}:group-{cycle}"
+        actions = [
+            call("arrange_shapes", shape_ids=targets, operation="group"),
+            call("move_shapes", shape_ids=[group_id], dx=0, dy=40),
+            call("arrange_shapes", shape_ids=[group_id], operation="ungroup"),
+            call("move_shapes", shape_ids=targets, dx=0, dy=-25),
+            call(
+                "style_shapes",
+                shape_ids=targets,
+                color=rng.choice(COLORS),
+                fill=None,
+                opacity=None,
+            ),
+            call("delete_shapes", shape_ids=targets),
+            call("canvas_command", operation="undo"),
+            call("canvas_command", operation="redo"),
+            call("canvas_command", operation="undo"),
+        ]
+        for position, action in enumerate(actions):
+            before = (
+                [{"kind": "move", "id": targets[0], "dx": 35, "dy": 25}]
+                if position == 3
+                else []
+            )
+            session.external(before)
+            row = {
+                "canvas": copy.deepcopy(session.canvas),
+                "history": copy.deepcopy(session.history),
+                "expected": action,
+            }
+            if action["name"] == "delete_shapes":
+                command, expected = (
+                    "Delete the selected shapes.",
+                    validate_call(action, session.canvas),
+                )
+            else:
+                command, expected = spoken_instruction(row, rng)
+            identifier = f"{group}:{len(turns)}"
+            rows.append(
+                {
+                    **row,
+                    "id": identifier,
+                    "group": group,
+                    "split": "train",
+                    "command": command,
+                    "expected": expected,
+                    "provenance": "editing cycles: drag, group, delete, undo, redo",
+                }
+            )
+            turns.append(
+                {
+                    "id": identifier,
+                    "command": command,
+                    "expected": expected,
+                    "before": before,
+                }
+            )
+            session.execute(command, expected, group_id)
+    return rows, {
+        "id": group,
+        "group": group,
+        "split": "train",
+        "initial_canvas": initial,
+        "turns": turns,
+    }
+
+
+def build_spoken_refinement(
+    source, output, *, count=48000, replay=48000, seed=65, practice_sessions=800
+):
+    rng = random.Random(seed)
+    pools, retained, evaluation, reserved = {}, [], [], set()
+    seen = 0
+    for row in iter_examples(source):
+        if row["split"] != "train":
+            evaluation.append(row)
+            reserved.add(
+                json.dumps(
+                    messages_for(row["command"], row["canvas"], row.get("history")),
+                    sort_keys=True,
+                )
+            )
+            continue
+        seen += 1
+        if len(retained) < replay:
+            retained.append(row)
+        else:
+            index = rng.randrange(seen)
+            if index < replay:
+                retained[index] = row
+        name, args = row["expected"]["name"], row["expected"]["arguments"]
+        key = name
+        if name == "style_shapes":
+            if (
+                args["color"] is None
+                or args["fill"] is not None
+                or args["opacity"] is not None
+            ):
+                continue
+        elif name in ("arrange_shapes", "canvas_command"):
+            if name == "arrange_shapes" and args["operation"] not in (
+                "group",
+                "ungroup",
+                "duplicate",
+            ):
+                continue
+            key += ":" + args["operation"]
+        elif name != "move_shapes":
+            continue
+        pool = pools.setdefault(key, [])
+        if len(pool) < 2000:
+            pool.append(row)
+    required = {
+        "move_shapes",
+        "style_shapes",
+        "arrange_shapes:ungroup",
+        "canvas_command:redo",
+    }
+    if not required <= pools.keys():
+        raise ValueError("Spoken refinement is missing required workflow examples.")
+    extra, attempts = [], 0
+    while len(extra) < count:
+        attempts += 1
+        if attempts > count * 20:
+            raise ValueError("Could not create enough unambiguous spoken examples.")
+        row = copy.deepcopy(rng.choice(pools[rng.choice(sorted(pools))]))
+        result = spoken_instruction(row, rng)
+        if result is None:
+            continue
+        row["command"], row["expected"] = result
+        if (
+            json.dumps(
+                messages_for(row["command"], row["canvas"], row.get("history")),
+                sort_keys=True,
+            )
+            in reserved
+        ):
+            continue
+        row.update(
+            id=f"spoken-train-{len(extra)}",
+            provenance="spoken workflow variation; frozen evaluation preserved",
+        )
+        extra.append(row)
+    practice_rows, cases = [], []
+    for index in range(practice_sessions):
+        examples, case = workflow_practice(rng, index)
+        practice_rows.extend(examples)
+        cases.append(case)
+    rows = [*retained, *extra, *practice_rows, *evaluation]
+    counts = audit_examples(rows)
+    rng.shuffle(rows)
+    output.mkdir(parents=True, exist_ok=False)
+    with (output / "examples.jsonl").open("w") as destination:
+        for row in rows:
+            destination.write(json.dumps(row) + "\n")
+    (output / "sessions.jsonl").write_bytes(
+        source.with_name("sessions.jsonl").read_bytes()
+    )
+    with (output / "sessions.jsonl").open("a") as destination:
+        for case in cases:
+            destination.write(json.dumps(case) + "\n")
+    summary = {
+        "seed": seed,
+        "splits": counts,
+        "spoken_examples": len(extra),
+        "replay_examples": len(retained),
+        "practice_sessions": len(cases),
+        "practice_turns": len(practice_rows),
+        "spoken_families": {key: len(pool) for key, pool in pools.items()},
+        "evaluation": "Original validation and test examples and sessions preserved",
+    }
+    (output / "dataset-summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate general canvas instruction and editing-session data."
@@ -712,9 +1025,21 @@ def main():
     parser.add_argument("--independent", type=int, default=80000)
     parser.add_argument("--sessions", type=int, default=4000)
     parser.add_argument("--replay", type=int, default=12000)
+    parser.add_argument("--spoken-refinement", type=int, default=0)
+    parser.add_argument("--practice-sessions", type=int, default=800)
     args = parser.parse_args()
     if args.output.resolve() == args.source.resolve():
         raise ValueError("Keep the previous dataset frozen.")
+    if args.spoken_refinement:
+        build_spoken_refinement(
+            args.source,
+            args.output,
+            count=args.spoken_refinement,
+            replay=args.replay,
+            seed=args.seed,
+            practice_sessions=args.practice_sessions,
+        )
+        return
     rows, sessions = build_workflow(
         args.source,
         seed=args.seed,
