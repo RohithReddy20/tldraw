@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from actions import (
     ACTION_MODELS,
@@ -629,6 +629,56 @@ class WorkflowTests(unittest.TestCase):
             wait_for_dataset("owner/checkpoint")
             self.assertEqual(cli.call_count, 3)
             self.assertEqual(sleep.call_count, 2)
+
+    def test_prompt_cache_reuses_prefill_without_reusing_changed_canvas_state(self):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from lab import PromptPrefixCache
+
+        tokenizer = Mock(bos_token="<bos>")
+        prefix = list(range(2132))
+        tokenizer.encode.side_effect = [prefix + [5], prefix + [7]]
+        encoder = Mock(prefix=prefix)
+
+        def prefill(tokens, cache):
+            values = tokens[:, None, :, None].astype(mx.float32)
+            cache[0].update_and_fetch(values, values)
+
+        model = Mock(side_effect=prefill)
+        with (
+            patch("lab.ToolPrefixEncoder", return_value=encoder),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[KVCache()]),
+        ):
+            retained = PromptPrefixCache(model, tokenizer)
+            first, first_cache = retained.prepare(model, tokenizer, "<bos>first")
+            first_cache[0].update_and_fetch(
+                mx.full((1, 1, 1, 1), 99), mx.full((1, 1, 1, 1), 99)
+            )
+            second, second_cache = retained.prepare(model, tokenizer, "<bos>second")
+        model.assert_called_once()
+        self.assertEqual(first, prefix[2048:] + [5])
+        self.assertEqual(second, prefix[2048:] + [7])
+        self.assertEqual(
+            (retained.cache[0].offset, first_cache[0].offset, second_cache[0].offset),
+            (2048, 2049, 2048),
+        )
+        self.assertEqual(second_cache[0].keys[0, 0, -1, 0].item(), 2047)
+
+    def test_prompt_cache_rejects_another_model_or_changed_tool_prefix(self):
+        from lab import PromptPrefixCache
+
+        model, tokenizer = Mock(), Mock(bos_token="<bos>")
+        with patch(
+            "lab.ToolPrefixEncoder", return_value=Mock(prefix=list(range(2132)))
+        ):
+            retained = PromptPrefixCache(model, tokenizer)
+        with self.assertRaisesRegex(ValueError, "different model"):
+            retained.prepare(Mock(), tokenizer, "<bos>other model")
+        tokenizer.encode.return_value = [-1] + list(range(1, 2228))
+        with self.assertRaisesRegex(ValueError, "retained tool prefix"):
+            retained.prepare(model, tokenizer, "<bos>changed tools")
+        model.assert_not_called()
 
 
 if __name__ == "__main__":

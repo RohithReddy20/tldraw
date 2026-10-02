@@ -170,6 +170,15 @@ The lab uses Python 3.12, `uv`, MLX-LM, and a pinned MLX conversion of
 Training and inference run on an Apple Silicon Mac without a paid inference API.
 The checkpoint retains the Gemma license.
 
+Both `evaluate` and `evaluate-sessions` accept `--cache-prefix` to reuse the first
+2,048 tool-instruction tokens. Each request receives its own copy of the cached
+state; changing the canvas or recent history still recomputes the remaining prompt.
+The original prefill boundaries and greedy decoding are retained. In 36 training
+probes covering all 18 tools on Apple Silicon, raw outputs and validated actions
+matched exactly; median time fell from 0.92 to 0.55 seconds. CUDA measurements run
+separately from the current frozen accuracy job. This is a speed check, not a new
+accuracy measurement.
+
 Run these commands from the monorepo root. Install
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if it is missing.
 

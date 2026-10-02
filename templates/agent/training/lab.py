@@ -1,4 +1,5 @@
 import argparse
+import copy
 import hashlib
 import json
 import platform
@@ -197,6 +198,42 @@ class ToolPrefixEncoder:
         ).removeprefix(self.tokenizer.bos_token)
         # The special turn token prevents subword merges across the cached boundary.
         return self.prefix + self.tokenizer.encode(body, add_special_tokens=False)
+
+
+class PromptPrefixCache:
+    def __init__(self, model, tokenizer):
+        self.model, self.tokenizer = model, tokenizer
+        encoder = ToolPrefixEncoder(tokenizer)
+        encoder.encode(messages_for("", {}), generation=True)
+        # Keep the original 2,048-token prefill boundaries to preserve GPU arithmetic.
+        self.tokens = encoder.prefix[: len(encoder.prefix) // 2048 * 2048]
+        self.cache = None
+
+    def prepare(self, model, tokenizer, prompt):
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
+        if model is not self.model or tokenizer is not self.tokenizer:
+            raise ValueError(
+                "The prefix cache belongs to a different model or tokenizer."
+            )
+        tokens = tokenizer.encode(
+            prompt,
+            add_special_tokens=tokenizer.bos_token is None
+            or not prompt.startswith(tokenizer.bos_token),
+        )
+        if tokens[: len(self.tokens)] != self.tokens:
+            raise ValueError("The prompt differs from the retained tool prefix.")
+        if not self.tokens:
+            return tokens, None
+        if self.cache is None:
+            self.cache = make_prompt_cache(model)
+            for start in range(0, len(self.tokens), 2048):
+                model(
+                    mx.array(self.tokens[start : start + 2048])[None], cache=self.cache
+                )
+                mx.eval([item.state for item in self.cache])
+        return tokens[len(self.tokens) :], copy.deepcopy(self.cache)
 
 
 def _task_hash():
@@ -428,7 +465,15 @@ def bundle_colab(resume=None, *, warm_start=None):
 
 
 def predict(
-    model, tokenizer, command, canvas, max_tokens=256, history=None, *, guarded=False
+    model,
+    tokenizer,
+    command,
+    canvas,
+    max_tokens=256,
+    history=None,
+    *,
+    guarded=False,
+    prefix_cache=None,
 ):
     import mlx.core as mx
     from mlx_lm import stream_generate
@@ -442,6 +487,11 @@ def predict(
     )
     mx.reset_peak_memory()
     start = time.perf_counter()
+    generation_options = {}
+    if prefix_cache is not None:
+        prompt, generation_options["prompt_cache"] = prefix_cache.prepare(
+            model, tokenizer, prompt
+        )
     chunks = []
     first_token = None
     for response in stream_generate(
@@ -450,6 +500,7 @@ def predict(
         prompt=prompt,
         max_tokens=max_tokens,
         sampler=make_sampler(temp=0),
+        **generation_options,
     ):
         if first_token is None:
             first_token = time.perf_counter() - start
@@ -491,6 +542,11 @@ def predict(
 def evaluate(args):
     prepare_data(write_rows=False)
     model, tokenizer = load_model(args.adapter)
+    prefix_cache = (
+        PromptPrefixCache(model, tokenizer)
+        if getattr(args, "cache_prefix", False)
+        else None
+    )
     examples = [e for e in read_examples() if e["split"] == args.split]
     if args.limit:
         examples = examples[: args.limit]
@@ -503,6 +559,7 @@ def evaluate(args):
             example["canvas"],
             history=example.get("history"),
             guarded=getattr(args, "guarded", False),
+            prefix_cache=prefix_cache,
         )
         result.update(
             {
@@ -524,6 +581,7 @@ def evaluate(args):
             "examples": rows,
             "evaluation_max_tokens": 256,
             "execution_guards": getattr(args, "guarded", False),
+            "cached_prompt_tokens": len(prefix_cache.tokens) if prefix_cache else 0,
         }
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -535,6 +593,11 @@ def evaluate_sessions(args):
     from sessions import CanvasSession, summarize_sessions
 
     model, tokenizer = load_model(args.adapter)
+    prefix_cache = (
+        PromptPrefixCache(model, tokenizer)
+        if getattr(args, "cache_prefix", False)
+        else None
+    )
     cases = [
         s for s in read_examples(ROOT / "sessions.jsonl") if s["split"] == args.split
     ]
@@ -557,6 +620,7 @@ def evaluate_sessions(args):
                 actual.canvas,
                 history=actual.history,
                 guarded=getattr(args, "guarded", False),
+                prefix_cache=prefix_cache,
             )
             created_id = f"{case['id']}:created-{turn}"
             try:
@@ -585,6 +649,7 @@ def evaluate_sessions(args):
         "adapter": str(args.adapter),
         "mode": "closed_loop_predicted_state",
         "execution_guards": getattr(args, "guarded", False),
+        "cached_prompt_tokens": len(prefix_cache.tokens) if prefix_cache else 0,
         "examples": rows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -671,6 +736,7 @@ def main():
     evaluation.add_argument("--limit", type=positive_integer)
     evaluation.add_argument("--output", type=Path, required=True)
     evaluation.add_argument("--guarded", action="store_true")
+    evaluation.add_argument("--cache-prefix", action="store_true")
     session_evaluation = commands.add_parser("evaluate-sessions")
     session_evaluation.add_argument("--adapter", type=Path, required=True)
     session_evaluation.add_argument(
@@ -679,6 +745,7 @@ def main():
     session_evaluation.add_argument("--limit", type=positive_integer)
     session_evaluation.add_argument("--output", type=Path, required=True)
     session_evaluation.add_argument("--guarded", action="store_true")
+    session_evaluation.add_argument("--cache-prefix", action="store_true")
     prediction = commands.add_parser("predict")
     prediction.add_argument("text")
     prediction.add_argument("--canvas", type=Path)
