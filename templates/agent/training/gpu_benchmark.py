@@ -382,12 +382,17 @@ def worker(root, output, case, verify=False, quality=False):
             reports.append(info)
             if info["iteration"] == warmup * accumulation:
                 steady_started = time.time()
-            if warm_start and rank == 0 and info["iteration"] % 500 == 0:
+            completed = info["iteration"] // accumulation
+            if (
+                warm_start
+                and rank == 0
+                and (completed == 50 or completed % config.get("save_every", 500) == 0)
+            ):
                 save_training_checkpoint(
                     model,
                     optimizer,
                     adapter_file.parent,
-                    info["iteration"] // accumulation,
+                    completed,
                     0,
                     archive=False,
                 )
@@ -604,6 +609,9 @@ def run_case(root, output, case, verify=False, quality=False):
     deadline = time.monotonic() + timeout
     error = None
     next_report = time.monotonic() + 30
+    last_progress = time.monotonic()
+    last_log_size = 0
+    progress_started = False
     try:
         for rank in range(workers):
             environment = dict(os.environ)
@@ -644,6 +652,22 @@ def run_case(root, output, case, verify=False, quality=False):
             if failed or time.monotonic() > deadline:
                 error = f"Worker failed: {failed}" if failed else "Case timed out"
                 break
+            if quality:
+                # Kaggle's streamed logs can lag behind the worker's local output.
+                worker_log = folder / "worker-0.log"
+                size = worker_log.stat().st_size
+                if size != last_log_size:
+                    last_progress = time.monotonic()
+                    last_log_size = size
+                    progress_started = (
+                        progress_started or "Iter " in worker_log.read_text()
+                    )
+                if progress_started and time.monotonic() - last_progress > 900:
+                    error = (
+                        "No new training report for 900 seconds; "
+                        "retained checkpoints are preserved."
+                    )
+                    break
             if quality and time.monotonic() >= next_report:
                 lines = (folder / "worker-0.log").read_text().splitlines()
                 if lines:

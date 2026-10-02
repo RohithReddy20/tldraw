@@ -62,6 +62,15 @@ def main():
     working = Path("/kaggle/working")
     root = working / "canvas-training"
     if args.train:
+        overrides = globals().get("CONFIG_OVERRIDES", {})
+        if overrides:
+            import yaml
+
+            if set(overrides) - {"refinement_micro_batch", "quality_timeout_seconds"}:
+                raise ValueError("Unknown GPU profile override.")
+            config = yaml.safe_load((root / "config.yaml").read_text())
+            config.update(overrides)
+            (root / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
         if args.task == "benchmark":
             from gpu_benchmark import benchmark
 
