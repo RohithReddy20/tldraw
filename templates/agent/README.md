@@ -79,6 +79,9 @@ Its reported accuracy does not establish accuracy on the expanded tools. Three
 Playwright tests verify the native editor workflows, including nested group movement,
 bound-arrow cleanup, redo preservation, and atomic rejection of stale or missing
 targets. Run them with `pnpm --filter tldraw-agent test:voice`.
+The optional model integration tests send commands through a running voice service
+and apply its responses in the native editor. Set `VOICE_MODEL_URL` to the service
+URL and `VOICE_SMOKE_AUDIO` to the synthetic speech fixture to enable both tests.
 
 The general-workflow training set contains 329,213 training examples, including
 4,000 editing sessions of 24–80 turns, 24,000 compound-request counterexamples, and
@@ -104,8 +107,12 @@ preserves the fresh test set. Connection failures are retried within the monitor
 ```sh
 uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \
   --kernel rohithresearch/canvas-270m-v5-general-workflow \
-  --workflow templates/agent/training/runs/kaggle/workflow
+  --workflow templates/agent/training/runs/kaggle/workflow --native-check
 ```
+
+`--native-check` starts a temporary local service after checkpoint verification,
+runs the model integration tests, and saves results under `native-check/`. It
+releases the service afterward and retains the verified adapter if a check fails.
 
 ## Local action-model training
 

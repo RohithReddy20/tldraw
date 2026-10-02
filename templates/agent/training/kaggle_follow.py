@@ -1,12 +1,15 @@
 import argparse
 import hashlib
 import json
+import os
 import re
+import socket
 import subprocess
 import sys
 import time
 import zipfile
 from pathlib import Path
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent
 NAME = "colab-270m-v4-sessions"
@@ -184,13 +187,107 @@ def finish_workflow(kernel, directory):
     )
 
 
+def verify_native(directory):
+    directory = directory.resolve()
+    launch = json.loads((directory / "run.json").read_text())
+    if launch["status"] != "complete":
+        raise ValueError("Native checks require a verified, completed workflow run.")
+    output = directory / "native-check"
+    output.mkdir(exist_ok=True)
+    report = {
+        "adapter_sha256": launch["adapter_sha256"],
+        "scope": "Native model integration with synthetic speech",
+        "browser_report": str(output / "browser.json"),
+        "speech_fixture_used": (ROOT / "runs/voice-smoke.wav").exists(),
+    }
+    process = None
+    started = time.monotonic()
+    with (output / "service.log").open("w") as service_log:
+        try:
+            with socket.socket() as address:
+                address.bind(("127.0.0.1", 0))
+                port = address.getsockname()[1]
+            url = f"http://127.0.0.1:{port}"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    str(ROOT / "voice_server.py"),
+                    "--adapter",
+                    launch["downloaded_adapter"],
+                    "--port",
+                    str(port),
+                ],
+                stdout=service_log,
+                stderr=subprocess.STDOUT,
+            )
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError("The local model service failed to start.")
+                try:
+                    with urlopen(url + "/health", timeout=2) as response:
+                        if response.status == 200:
+                            break
+                except OSError:
+                    time.sleep(1)
+            else:
+                raise TimeoutError("The local model service did not become ready.")
+            environment = {
+                **os.environ,
+                "VOICE_MODEL_URL": url,
+                "PLAYWRIGHT_JSON_OUTPUT_NAME": str(output / "browser.json"),
+            }
+            if report["speech_fixture_used"]:
+                environment["VOICE_SMOKE_AUDIO"] = str(ROOT / "runs/voice-smoke.wav")
+            with (output / "browser.log").open("w") as browser_log:
+                result = subprocess.run(
+                    [
+                        "pnpm",
+                        "--filter",
+                        "tldraw-agent",
+                        "test:voice",
+                        "--grep",
+                        "model integration",
+                        "--reporter=line,json",
+                    ],
+                    cwd=ROOT.parents[2],
+                    env=environment,
+                    stdout=browser_log,
+                    stderr=subprocess.STDOUT,
+                    timeout=420,
+                )
+            report.update(
+                status="passed" if result.returncode == 0 else "failed",
+                returncode=result.returncode,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            report.update(status="failed", error=str(error))
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    report["seconds"] = time.monotonic() - started
+    (output / "result.json").write_text(json.dumps(report, indent=2))
+    launch["native_verification"] = report
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    print(f"Native integration check {report['status']}; reports: {output}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Retrieve and evaluate Kaggle training."
     )
     parser.add_argument("--kernel", required=True)
     parser.add_argument("--workflow", type=Path)
+    parser.add_argument("--native-check", action="store_true")
     args = parser.parse_args()
+    if args.native_check and not args.workflow:
+        parser.error("--native-check requires --workflow.")
     output = args.workflow or OUTPUT
     output.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 13 * 60 * 60
@@ -229,6 +326,8 @@ def main():
                 print(f"Result download interrupted: {error}; retrying.", flush=True)
                 time.sleep(60)
                 continue
+            if args.native_check:
+                verify_native(args.workflow)
             return
         time.sleep(60)
     raise TimeoutError("Kaggle training exceeded its supervised runtime.")

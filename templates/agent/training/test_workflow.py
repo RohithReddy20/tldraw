@@ -251,6 +251,45 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(sleep.call_count, 5)
             self.assertEqual(finish.call_count, 2)
 
+    def test_native_failure_preserves_the_verified_adapter_and_releases_its_service(
+        self,
+    ):
+        from kaggle_follow import verify_native
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launch = {"status": "training"}
+            (root / "run.json").write_text(json.dumps(launch))
+            with patch("kaggle_follow.subprocess.Popen") as start:
+                with self.assertRaisesRegex(ValueError, "completed workflow"):
+                    verify_native(root)
+                start.assert_not_called()
+            launch.update(
+                status="complete",
+                adapter_sha256="verified",
+                downloaded_adapter="candidate",
+                test_set_used=False,
+            )
+            (root / "run.json").write_text(json.dumps(launch))
+            with (
+                patch("kaggle_follow.subprocess.Popen") as start,
+                patch("kaggle_follow.urlopen") as health,
+                patch(
+                    "kaggle_follow.subprocess.run",
+                    return_value=subprocess.CompletedProcess([], 1),
+                ),
+            ):
+                start.return_value.poll.return_value = None
+                health.return_value.__enter__.return_value.status = 200
+                verify_native(root)
+                start.return_value.terminate.assert_called_once()
+                start.return_value.wait.assert_called_once()
+            completed = json.loads((root / "run.json").read_text())
+            self.assertEqual(completed["status"], "complete")
+            self.assertEqual(completed["downloaded_adapter"], "candidate")
+            self.assertFalse(completed["test_set_used"])
+            self.assertEqual(completed["native_verification"]["status"], "failed")
+
     def test_remote_results_reject_a_different_final_adapter(self):
         import numpy as np
         from safetensors.numpy import save_file

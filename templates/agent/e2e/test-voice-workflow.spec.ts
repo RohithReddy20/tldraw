@@ -1,6 +1,13 @@
+import { readFileSync } from 'node:fs'
 import { expect, test } from '@playwright/test'
+import type { APIRequestContext, Page, TestInfo } from '@playwright/test'
 import type { Editor } from 'tldraw'
-import type { canvasContext, executeCanvasAction } from '../client/local-voice/voiceActions'
+import type {
+	CanvasAction,
+	canvasContext,
+	executeCanvasAction,
+	VoiceHistory,
+} from '../client/local-voice/voiceActions'
 
 declare const editor: Editor
 declare const voice: { context: typeof canvasContext; execute: typeof executeCanvasAction }
@@ -192,4 +199,114 @@ test('arranges shapes and rejects stale or partially missing targets atomically'
 		cleared: true,
 	})
 	await expect(page.locator('.tl-canvas').first()).toBeVisible()
+})
+
+test.describe('model integration', () => {
+	test.skip(!process.env.VOICE_MODEL_URL, 'Requires a running local action model.')
+	test.setTimeout(180_000)
+
+	function session(page: Page, request: APIRequestContext, info: TestInfo) {
+		let history: VoiceHistory = { turns: [], last_created_id: null, last_edited_id: null }
+		const rows: unknown[] = []
+		return async (
+			input: { command: string } | { audio: string },
+			expected: CanvasAction['name']
+		) => {
+			const canvas = await page.evaluate(() => voice.context(editor))
+			const response = await request.post(`${process.env.VOICE_MODEL_URL}/command`, {
+				data: { ...input, canvas, history },
+				timeout: 60_000,
+			})
+			const result = await response.json()
+			rows.push({
+				input: 'command' in input ? input.command : 'synthetic speech',
+				expected,
+				result,
+			})
+			await info.attach(`model-command-${rows.length}`, {
+				body: JSON.stringify(rows.at(-1), null, 2),
+				contentType: 'application/json',
+			})
+			expect(response.ok(), JSON.stringify(result)).toBe(true)
+			expect(result.action.name, JSON.stringify(result)).toBe(expected)
+			const outcome = await page.evaluate(
+				({ action, canvas }) => voice.execute(editor, action, canvas),
+				{ action: result.action, canvas }
+			)
+			history = {
+				turns: [
+					...history.turns,
+					{
+						command: result.command,
+						action: outcome.action,
+						...(outcome.createdId ? { created_id: outcome.createdId } : {}),
+					},
+				].slice(-3),
+				last_created_id: outcome.createdId ?? history.last_created_id,
+				last_edited_id: outcome.editedId ?? history.last_edited_id,
+			}
+			return { result, outcome, canvas: await page.evaluate(() => voice.context(editor)) }
+		}
+	}
+
+	test('executes model commands across native editing history', async ({ page, request }, info) => {
+		const send = session(page, request, info)
+		const create = await send(
+			{ command: 'Draw a rectangle labelled Customer at x 100 and y 100.' },
+			'create_shape'
+		)
+		expect(create.canvas.shapes).toHaveLength(1)
+		expect(create.canvas.shapes[0]).toMatchObject({
+			kind: 'rectangle',
+			text: 'Customer',
+			x: 100,
+			y: 100,
+		})
+		const moved = await send({ command: 'Move it right by 80.' }, 'move_shapes')
+		expect(moved.canvas.shapes[0]).toMatchObject({ x: 180, y: 100 })
+		const styled = await send({ command: 'Make it blue.' }, 'style_shapes')
+		expect(styled.canvas.shapes[0].color).toBe('blue')
+		const copy = await send({ command: 'Duplicate it.' }, 'arrange_shapes')
+		expect(copy.canvas.shapes).toHaveLength(2)
+		const selected = await send({ command: 'Select all.' }, 'canvas_command')
+		expect(selected.canvas.selected_ids).toHaveLength(2)
+		const down = await send({ command: 'Move the selected shapes down by 40.' }, 'move_shapes')
+		expect(down.canvas.shapes.map((s) => s.y).sort((a, b) => a - b)).toEqual([140, 164])
+		const group = await send({ command: 'Group the selected shapes.' }, 'arrange_shapes')
+		expect(group.canvas.shapes.filter((s) => s.kind === 'group')).toHaveLength(1)
+		const ungroup = await send({ command: 'Ungroup it.' }, 'arrange_shapes')
+		expect(ungroup.canvas.shapes).toHaveLength(2)
+		expect(ungroup.canvas.selected_ids).toHaveLength(2)
+		const deleted = await send({ command: 'Delete the selected shapes.' }, 'delete_shapes')
+		expect(deleted.canvas.shapes).toHaveLength(0)
+		const undone = await send({ command: 'Undo.' }, 'canvas_command')
+		expect(undone.canvas.shapes).toHaveLength(2)
+		const redone = await send({ command: 'Redo.' }, 'canvas_command')
+		expect(redone.canvas.shapes).toHaveLength(0)
+		const noEdit = await send({ command: 'Explain what is on the canvas.' }, 'no_action')
+		expect(noEdit.canvas).toEqual(redone.canvas)
+	})
+
+	test('transcribes synthetic speech and applies the model edit', async ({
+		page,
+		request,
+	}, info) => {
+		test.skip(!process.env.VOICE_SMOKE_AUDIO, 'Requires the synthetic speech fixture.')
+		await page.evaluate(() => {
+			voice.execute(
+				editor,
+				{ name: 'create_schema_box', arguments: { name: 'User', fields: [], methods: [] } },
+				voice.context(editor)
+			)
+		})
+		const audio = readFileSync(process.env.VOICE_SMOKE_AUDIO!).toString('base64')
+		const edited = await session(page, request, info)({ audio }, 'add_property')
+		expect(edited.result.command.toLowerCase()).toContain('email')
+		expect(edited.canvas.schemas).toHaveLength(1)
+		expect(edited.canvas.schemas[0]).toMatchObject({
+			name: 'User',
+			properties: ['email'],
+			methods: [],
+		})
+	})
 })
