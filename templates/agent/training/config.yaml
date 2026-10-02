@@ -1,0 +1,26 @@
+model: mlx-community/functiongemma-270m-it-bf16
+train: true
+fine_tune_type: lora
+seed: 42
+num_layers: -1
+batch_size: 8
+iters: 15000
+learning_rate: 0.00003
+lr_schedule:
+  name: cosine_decay
+  arguments: [0.00003, 14800, 0.000003]
+  warmup: 200
+  warmup_init: 0.000001
+max_seq_length: 2048
+mask_prompt: true
+loss_mode: completion_tokens_v1
+completion_window: 96
+grad_checkpoint: true
+steps_per_report: 100
+steps_per_eval: 1000
+val_batches: 32
+save_every: 500
+lora_parameters:
+  rank: 32
+  dropout: 0.0
+  scale: 8.0
