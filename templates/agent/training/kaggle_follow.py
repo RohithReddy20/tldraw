@@ -104,7 +104,7 @@ def finish(kernel):
     print(f"Fresh test reports saved to {run}.", flush=True)
 
 
-def finish_workflow(kernel, directory):
+def finish_workflow(kernel, directory, *, training_only=False):
     from gpu_benchmark import quality_comparison
 
     download = directory / "download"
@@ -130,6 +130,41 @@ def finish_workflow(kernel, directory):
         "200",
         timeout=1200,
     )
+    result, weights = verify_workflow_checkpoint(download, launch)
+    launch.update(
+        status="trained",
+        downloaded_adapter=str(weights.parent),
+        verification="checkpoint weights, task, dataset and warm-start hashes match",
+        adapter_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
+        training=result,
+        test_set_used=False,
+    )
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    if training_only:
+        print("Recovered and verified the finished training checkpoint.", flush=True)
+        return
+    candidate = weights.parent.parent
+    reports = {
+        mode: quality_comparison(
+            download / "refinement/baseline", candidate, guarded=mode == "guarded"
+        )
+        for mode in ("raw", "guarded")
+    }
+    for report in reports.values():
+        report["scope"] = (
+            f"General workflow validation after {launch['updates']} updates; "
+            "native layout is verified separately in browser tests."
+        )
+    (directory / "verified-comparison.json").write_text(json.dumps(reports, indent=2))
+    launch.update(status="complete", validation=reports)
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    print(
+        f"Verified the completed general workflow model. Reports: {directory}",
+        flush=True,
+    )
+
+
+def verify_workflow_checkpoint(download, launch):
     candidate = download / "refinement/dual-window"
     result = json.loads((download / "refinement-training.json").read_text())
     for key, expected in (
@@ -159,39 +194,18 @@ def finish_workflow(kernel, directory):
         or not all(np.array_equal(values, saved[key]) for key, values in final.items())
     ):
         raise ValueError("Workflow weights differ from the completed checkpoint.")
-    reports = {
-        mode: quality_comparison(
-            download / "refinement/baseline", candidate, guarded=mode == "guarded"
-        )
-        for mode in ("raw", "guarded")
-    }
-    for report in reports.values():
-        report["scope"] = (
-            f"General workflow validation after {launch['updates']} updates; "
-            "native layout is verified separately in browser tests."
-        )
-    (directory / "verified-comparison.json").write_text(json.dumps(reports, indent=2))
-    launch.update(
-        status="complete",
-        downloaded_adapter=str(weights.parent),
-        verification="checkpoint weights, task, dataset and warm-start hashes match",
-        adapter_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
-        training=result,
-        validation=reports,
-        test_set_used=False,
-    )
-    (directory / "run.json").write_text(json.dumps(launch, indent=2))
-    print(
-        f"Verified the completed general workflow model. Reports: {directory}",
-        flush=True,
-    )
+    return result, weights
 
 
 def verify_native(directory):
     directory = directory.resolve()
     launch = json.loads((directory / "run.json").read_text())
-    if launch["status"] != "complete":
-        raise ValueError("Native checks require a verified, completed workflow run.")
+    if launch["status"] not in ("trained", "complete") or not launch.get(
+        "adapter_sha256"
+    ):
+        raise ValueError(
+            "Native checks require a verified, completed workflow checkpoint."
+        )
     output = directory / "native-check"
     output.mkdir(exist_ok=True)
     report = {
@@ -324,8 +338,11 @@ def main():
                 log = cli("kernels", "logs", args.kernel)
                 (output / "kernel.log").write_text(log)
                 if state != "complete":
+                    if args.workflow:
+                        finish_workflow(args.kernel, args.workflow, training_only=True)
                     raise RuntimeError(
-                        f"Kaggle training failed; see {output / 'kernel.log'}"
+                        f"Kaggle job failed; any completed workflow checkpoint was "
+                        f"recovered. See {output / 'kernel.log'}"
                     )
                 if args.workflow:
                     finish_workflow(args.kernel, args.workflow)

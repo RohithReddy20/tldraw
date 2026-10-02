@@ -67,6 +67,9 @@ class CanvasSession:
             before = self.document()
             ids = self.objects()
             kind = event["kind"]
+            # Earlier model errors can leave the oracle's drag/text target absent.
+            if kind in ("move", "text") and event["id"] not in ids:
+                continue
             if kind == "select":
                 self.canvas["selected_ids"] = [i for i in event["ids"] if i in ids]
             elif kind == "reorder":

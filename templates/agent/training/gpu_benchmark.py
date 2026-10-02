@@ -833,6 +833,75 @@ def refinement_experiment(root, working):
     )
 
 
+def resume_refinement_evaluation(root, working, expected):
+    from kaggle_follow import verify_workflow_checkpoint
+    from lab import _metadata
+
+    sources = list(Path("/kaggle/input").rglob("refinement-training.json"))
+    if len(sources) != 1:
+        raise ValueError("Expected one mounted completed refinement run.")
+    source = sources[0].parent
+    trained, weights = verify_workflow_checkpoint(source, expected)
+    metadata = _metadata()
+    for key in ("dataset_sha256", "task_sha256"):
+        if metadata[key] != expected[key]:
+            raise ValueError(f"Evaluation input differs from training in {key}.")
+    if hashlib.sha256(weights.read_bytes()).hexdigest() != expected["adapter_sha256"]:
+        raise ValueError("Evaluation candidate differs from the recovered adapter.")
+    baseline = source / "refinement/baseline/adapter/adapters.safetensors"
+    if (
+        hashlib.sha256(baseline.read_bytes()).hexdigest()
+        != expected["warm_start_sha256"]
+    ):
+        raise ValueError("Evaluation baseline differs from the retained model.")
+    output = working / "refinement"
+    for case in ("baseline", "dual-window"):
+        origin, destination = source / "refinement" / case, output / case
+        (destination / "adapter").mkdir(parents=True)
+        for filename in (
+            "config.yaml",
+            "adapter/adapters.safetensors",
+            "adapter/adapter_config.json",
+        ):
+            shutil.copyfile(origin / filename, destination / filename)
+        # Completed command reports survive a later session-evaluator failure.
+        if (origin / "valid.json").exists():
+            report = json.loads((origin / "valid.json").read_text())
+            if any(
+                report[key] != metadata[key]
+                for key in ("dataset_sha256", "task_sha256")
+            ):
+                raise ValueError(
+                    "Retained command report uses different validation data."
+                )
+            if report["split"] != "valid" or report.get("execution_guards", False):
+                raise ValueError(
+                    "Retained command report has the wrong evaluation mode."
+                )
+            report["adapter_sha256"] = hashlib.sha256(
+                (destination / "adapter/adapters.safetensors").read_bytes()
+            ).hexdigest()
+            (destination / "valid.json").write_text(json.dumps(report, indent=2))
+    checkpoint = f"adapter/checkpoints/{expected['updates']:07d}"
+    shutil.copytree(
+        source / "refinement/dual-window" / checkpoint,
+        output / "dual-window" / checkpoint,
+    )
+    shutil.copyfile(sources[0], working / "refinement-training.json")
+    print(
+        f"Recovered update {trained['end_step']}; evaluating without training.",
+        flush=True,
+    )
+    evaluate_pair(root, output)
+    result = {
+        mode: quality_comparison(
+            output / "baseline", output / "dual-window", guarded=mode == "guarded"
+        )
+        for mode in ("raw", "guarded")
+    }
+    (working / "refinement-comparison.json").write_text(json.dumps(result, indent=2))
+
+
 def quality_experiment(root, working):
     output = working / "quality"
     output.mkdir(exist_ok=True)
@@ -914,7 +983,7 @@ def evaluate_pair(root, output):
                     start_new_session=True,
                 )
             )
-        deadline = time.monotonic() + 5400
+        deadline = time.monotonic() + 7200
         next_report = time.monotonic() + 30
         while any(process.poll() is None for process in evaluations):
             if any(process.poll() not in (None, 0) for process in evaluations):
@@ -945,35 +1014,47 @@ def evaluate_quality(output):
     import mlx.core as mx
     import yaml
 
-    from lab import evaluate, evaluate_sessions
+    from lab import _metadata, evaluate, evaluate_sessions
 
     if mx.default_device() != mx.gpu:
         raise RuntimeError("Accuracy evaluation requires the CUDA GPU.")
-    for function, name in ((evaluate, "valid"), (evaluate_sessions, "sessions-valid")):
-        function(
-            argparse.Namespace(
-                split="valid",
-                adapter=output / "adapter",
-                output=output / f"{name}.json",
-                limit=None,
-            )
-        )
-        mx.clear_cache()
+    metadata = _metadata()
+    adapter_sha256 = hashlib.sha256(
+        (output / "adapter/adapters.safetensors").read_bytes()
+    ).hexdigest()
     config = yaml.safe_load((output / "config.yaml").read_text())
-    if config.get("evaluate_guards"):
+    for guarded in (False, True) if config.get("evaluate_guards") else (False,):
         for function, name in (
             (evaluate, "valid"),
             (evaluate_sessions, "sessions-valid"),
         ):
+            suffix = "-guarded" if guarded else ""
+            report_path = output / f"{name}{suffix}.json"
+            if name == "valid" and report_path.exists():
+                report = json.loads(report_path.read_text())
+                if (
+                    all(
+                        report[key] == metadata[key]
+                        for key in ("dataset_sha256", "task_sha256")
+                    )
+                    and report.get("adapter_sha256") == adapter_sha256
+                    and report["split"] == "valid"
+                    and report.get("execution_guards", False) == guarded
+                ):
+                    print(f"Reusing verified {report_path.name}.", flush=True)
+                    continue
             function(
                 argparse.Namespace(
                     split="valid",
                     adapter=output / "adapter",
-                    output=output / f"{name}-guarded.json",
+                    output=report_path,
                     limit=None,
-                    guarded=True,
+                    guarded=guarded,
                 )
             )
+            report = json.loads(report_path.read_text())
+            report["adapter_sha256"] = adapter_sha256
+            report_path.write_text(json.dumps(report, indent=2))
             mx.clear_cache()
 
 
