@@ -71,7 +71,8 @@ undo/redo, pan/zoom, schema properties/methods, and bound arrow connections.
 Text height and note dimensions follow tldraw's layout constraints. Each request
 still produces one action; compound edits are rejected. There are at most 30 schema
 boxes, 60 other shapes, and 30 properties or methods per box. The expanded prompt
-budget is 6,144 tokens, including a 256-token response allowance.
+budget is 6,144 tokens, including a 256-token response allowance. Selection context
+can include the full canvas; an individual edit can target up to 30 shapes.
 
 The retained 15,000-update adapter was trained on the earlier six-tool contract.
 Its reported accuracy does not establish accuracy on the expanded tools. Three

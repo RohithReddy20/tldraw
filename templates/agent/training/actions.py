@@ -73,7 +73,7 @@ class Camera(StrictModel):
 class Canvas(StrictModel):
     schemas: list[SchemaBox] = Field(default_factory=list, max_length=30)
     shapes: list[CanvasShape] = Field(default_factory=list, max_length=60)
-    selected_ids: list[Name] = Field(default_factory=list, max_length=30)
+    selected_ids: list[Name] = Field(default_factory=list, max_length=90)
     can_undo: bool = False
     can_redo: bool = False
     camera: Camera = Field(default_factory=Camera)

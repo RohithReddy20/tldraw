@@ -6,7 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from actions import ACTION_MODELS, TOOLS, messages_for, parse_call, validate_call
+from actions import (
+    ACTION_MODELS,
+    TOOLS,
+    messages_for,
+    model_canvas,
+    parse_call,
+    validate_call,
+)
 from build_workflow import build_workflow, call
 from dataset import audit_examples, training_row
 from sessions import CanvasSession
@@ -22,6 +29,29 @@ class WorkflowTests(unittest.TestCase):
             ],
             "selected_ids": ["a", "b"],
         }
+
+    def test_select_all_keeps_large_selections_available_for_canvas_commands(self):
+        shapes = [
+            {"id": f"shape-{index}", "name": f"Item {index}", "kind": "rectangle"}
+            for index in range(40)
+        ]
+        canvas = {"shapes": shapes, "selected_ids": [shape["id"] for shape in shapes]}
+        context, identifiers = model_canvas(canvas)
+        self.assertEqual(
+            context["selected_ids"], [identifiers[shape["id"]] for shape in shapes]
+        )
+        action = {
+            "name": "canvas_command",
+            "arguments": {"operation": "clear_selection"},
+        }
+        self.assertEqual(validate_call(action, canvas), action)
+        self.assertEqual(
+            validate_call(
+                {"name": "canvas_command", "arguments": {"operation": "zoom_to_fit"}},
+                canvas,
+            )["name"],
+            "canvas_command",
+        )
 
     def test_array_aliases_and_optional_coordinates_round_trip(self):
         text = (
