@@ -833,14 +833,15 @@ def refinement_experiment(root, working):
     )
 
 
-def resume_refinement_evaluation(root, working, expected):
+def resume_refinement_evaluation(root, working, expected, *, source=None):
     from kaggle_follow import verify_workflow_checkpoint
     from lab import _metadata
 
-    sources = list(Path("/kaggle/input").rglob("refinement-training.json"))
-    if len(sources) != 1:
-        raise ValueError("Expected one mounted completed refinement run.")
-    source = sources[0].parent
+    if source is None:
+        sources = list(Path("/kaggle/input").rglob("refinement-training.json"))
+        if len(sources) != 1:
+            raise ValueError("Expected one mounted completed refinement run.")
+        source = sources[0].parent
     trained, weights = verify_workflow_checkpoint(source, expected)
     metadata = _metadata()
     for key in ("dataset_sha256", "task_sha256"):
@@ -887,7 +888,9 @@ def resume_refinement_evaluation(root, working, expected):
         source / "refinement/dual-window" / checkpoint,
         output / "dual-window" / checkpoint,
     )
-    shutil.copyfile(sources[0], working / "refinement-training.json")
+    shutil.copyfile(
+        source / "refinement-training.json", working / "refinement-training.json"
+    )
     print(
         f"Recovered update {trained['end_step']}; evaluating without training.",
         flush=True,

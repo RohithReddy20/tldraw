@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 
-def extract_bundle(bundle, root, digest):
+def extract_archive(bundle, root, digest):
     if hashlib.sha256(bundle.read_bytes()).hexdigest() != digest:
         raise ValueError("Kaggle input bundle checksum mismatch.")
     with zipfile.ZipFile(bundle) as archive:
@@ -17,6 +17,10 @@ def extract_bundle(bundle, root, digest):
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError("Invalid path in training bundle.")
         archive.extractall(root)
+
+
+def extract_bundle(bundle, root, digest):
+    extract_archive(bundle, root, digest)
     if (root / "warm-start.json").exists():
         warm = json.loads((root / "warm-start.json").read_text())
         if (
@@ -86,8 +90,16 @@ def main():
         elif args.task == "evaluate":
             from gpu_benchmark import resume_refinement_evaluation
 
+            bundles = list(Path("/kaggle/input").rglob("canvas-checkpoint.bundle"))
+            if len(bundles) != 1:
+                raise ValueError("Expected one mounted completed checkpoint bundle.")
+            source = working / "recovered-checkpoint"
+            source.mkdir(exist_ok=False)
+            extract_archive(
+                bundles[0], source, globals()["EVALUATION_CHECKPOINT_SHA256"]
+            )
             resume_refinement_evaluation(
-                root, working, globals()["EVALUATION_EXPECTED"]
+                root, working, globals()["EVALUATION_EXPECTED"], source=source
             )
         else:
             from colab_job import train_job
