@@ -97,7 +97,10 @@ It targets 6,000 updates, batch eight, micro batch two per GPU, completion windo
 160, and a 6,144-token limit. It starts from the retained 15,000-update adapter
 with a fresh optimizer. The checked-in profile is `training/workflow-config.yaml`.
 All generated calls passed round-trip checks; the longest example uses 4,330
-tokens and the longest response uses 92. Expanded-model accuracy remains pending.
+tokens and the longest response uses 92. All 6,000 training updates finished;
+GPU validation is running and expanded-model accuracy remains pending. Local checks
+pass: 42 Python lab tests and four native browser tests. The two model integration
+tests run after the completed adapter is downloaded and verified.
 Run metadata and live output are `training/runs/kaggle/workflow/run.json` and
 `live.log`. The observer downloads results and verifies final checkpoint weights
 and dataset/task hashes; it compares raw and guarded validation separately and
