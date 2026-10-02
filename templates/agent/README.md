@@ -136,7 +136,9 @@ A separate continuation waits for the native tests to pass before
 launching selected-model scoring on Kaggle: raw and guarded validation, plus guarded
 fresh tests covering 2,880 independent commands and 1,440 session turns. A failed
 native check leaves the fresh test set untouched. Final reports must match the same
-adapter, dataset, and task hashes and include every expected example. Reattach the
+adapter, dataset, and task hashes and include every expected example. The checkpoint
+upload receipt permits resuming after temporary Kaggle readiness errors without
+uploading the weights again. Reattach the
 training observer with:
 
 ```sh

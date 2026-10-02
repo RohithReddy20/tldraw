@@ -616,6 +616,20 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(saved["test_set_used"])
             self.assertTrue(saved["test_set_started"])
 
+    def test_checkpoint_readiness_retries_transient_errors_and_requires_ready(self):
+        from kaggle_follow import wait_for_dataset
+
+        failure = subprocess.CalledProcessError(1, ["kaggle", "datasets", "status"])
+        with (
+            patch(
+                "kaggle_follow.cli", side_effect=[failure, "not ready", "ready\n"]
+            ) as cli,
+            patch("kaggle_follow.time.sleep") as sleep,
+        ):
+            wait_for_dataset("owner/checkpoint")
+            self.assertEqual(cli.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

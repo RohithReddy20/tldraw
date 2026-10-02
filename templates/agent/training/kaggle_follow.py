@@ -25,6 +25,18 @@ def cli(*arguments, timeout=60):
     return result.stdout
 
 
+def wait_for_dataset(dataset):
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        try:
+            if cli("datasets", "status", dataset).strip().lower() == "ready":
+                return
+        except subprocess.SubprocessError:
+            print("Kaggle upload readiness check unavailable; retrying.", flush=True)
+        time.sleep(30)
+    raise TimeoutError("Final checkpoint upload did not become ready.")
+
+
 def finish(kernel):
     cli(
         "kernels",
@@ -283,20 +295,27 @@ def launch_final_scoring(directory):
             indent=2,
         )
     )
-    cli(
-        "datasets",
-        "create",
-        "--path",
-        str(inputs),
-        "--quiet",
-        "--keep-tabular",
-        timeout=1200,
-    )
-    deadline = time.monotonic() + 600
-    while "ready" not in cli("datasets", "status", dataset).lower():
-        if time.monotonic() > deadline:
-            raise TimeoutError("Final checkpoint upload did not become ready.")
-        time.sleep(30)
+    receipt = output / "checkpoint-upload.json"
+    upload = {"dataset": dataset, "sha256": digest}
+    if receipt.exists():
+        if json.loads(receipt.read_text()) != upload:
+            raise ValueError("Uploaded checkpoint receipt differs from this bundle.")
+        print("Resuming the accepted checkpoint upload.", flush=True)
+    else:
+        created = cli(
+            "datasets",
+            "create",
+            "--path",
+            str(inputs),
+            "--quiet",
+            "--keep-tabular",
+            timeout=1200,
+        )
+        if "Your private Dataset is being created." not in created:
+            raise RuntimeError("Kaggle did not accept the checkpoint dataset.")
+        receipt.write_text(json.dumps(upload, indent=2))
+    wait_for_dataset(dataset)
+    print("Checkpoint upload is ready; preparing the GPU accuracy job.", flush=True)
     kernel = output / "kernel"
     kernel.mkdir(exist_ok=True)
     metadata = json.loads((directory / "kernel/kernel-metadata.json").read_text())
