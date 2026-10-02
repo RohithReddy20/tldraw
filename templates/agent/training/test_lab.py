@@ -12,6 +12,48 @@ from lab import _summarize, verify_token_cache
 from sessions import CanvasSession, summarize_sessions
 
 
+class RefinementDataTests(unittest.TestCase):
+    def test_refinement_preserves_holdouts_and_pairs_missing_fields_with_present_fields(
+        self,
+    ):
+        from build_dataset import build_refinement
+
+        original = [
+            {
+                "id": split,
+                "group": split,
+                "split": split,
+                "command": f"Explain {split}.",
+                "canvas": {},
+                "expected": {
+                    "name": "no_action",
+                    "arguments": {"reason": "unsupported_request"},
+                },
+            }
+            for split in ("train", "valid", "test")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "examples.jsonl"
+            source.write_text("".join(json.dumps(row) + "\n" for row in original))
+            rows = build_refinement(source, seed=54, replay_count=1, pairs=2)
+        self.assertEqual([row for row in rows if row["split"] != "train"], original[1:])
+        generated = {row["id"]: row for row in rows if row["id"].startswith("v5-hard-")}
+        for index in range(2):
+            present, absent = (
+                generated[f"v5-hard-{index}:2"],
+                generated[f"v5-hard-{index}:3"],
+            )
+            self.assertEqual(present["command"], absent["command"])
+            self.assertEqual(present["expected"]["name"], "remove_property")
+            field = present["expected"]["arguments"]["property_name"]
+            self.assertIn(field, present["canvas"]["schemas"][0]["properties"])
+            self.assertNotIn(field, absent["canvas"]["schemas"][0]["properties"])
+            self.assertEqual(
+                absent["expected"],
+                {"name": "no_action", "arguments": {"reason": "missing_target"}},
+            )
+
+
 class ActionValidationTests(unittest.TestCase):
     def test_short_ids_round_trip_to_real_canvas_ids(self):
         canvas = {

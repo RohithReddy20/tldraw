@@ -2,7 +2,6 @@ import argparse
 import base64
 import json
 import logging
-import re
 import shutil
 import subprocess
 import tempfile
@@ -55,62 +54,6 @@ class CommandRequest(StrictModel):
         if bool(self.command.strip()) == bool(self.audio):
             raise ValueError("Provide a command or an audio recording.")
         return self
-
-
-def no_action(reason):
-    return {"name": "no_action", "arguments": {"reason": reason}}
-
-
-def execution_guard(command, action, canvas, history):
-    if action["name"] == "no_action":
-        return action
-    if re.search(
-        r"\band\s+(?:then\s+)?(?:move|rotate|color|delete|rename|connect|add|remove|create|draw)\b",
-        command,
-        re.I,
-    ):
-        # Method lists can contain conjunctions without requesting another edit.
-        if not (
-            action["name"] == "create_schema_box"
-            and re.search(r"\b(?:properties|fields|methods|functions)\b", command, re.I)
-        ):
-            return no_action("unsupported_request")
-        if re.search(
-            r"\band\s+(?:then\s+)?(?:move|rotate|color|delete|rename|connect)\b",
-            command,
-            re.I,
-        ):
-            return no_action("unsupported_request")
-    schemas = {item["id"]: item for item in canvas["schemas"]}
-    for kind, expression in (
-        (
-            "created",
-            r"\b(?:last created|(?:schema|class|box) we (?:last |just )?created)\b",
-        ),
-        ("edited", r"\b(?:last edited|(?:schema|class|box) we (?:last )?edited)\b"),
-    ):
-        if (
-            re.search(expression, command, re.I)
-            and history.get(f"last_{kind}_id") not in schemas
-        ):
-            return no_action("missing_target")
-    if action["name"] != "create_schema_box":
-        for key in ("schema_id", "source_id", "target_id"):
-            target = schemas.get(action["arguments"].get(key))
-            if target is None:
-                continue
-            name = target["name"]
-            duplicates = sum(
-                item["name"].casefold() == name.casefold() for item in schemas.values()
-            )
-            named = re.search(
-                rf"\b(?:to|from|on|in|of|named|called|rename|connect)\s+(?:the\s+)?(?:(?:schema|box|class)\s+)?{re.escape(name)}(?!\w)|(?<!\w){re.escape(name)}(?:['’]s|\s+(?:schema|box|class)\b)",
-                command,
-                re.I,
-            )
-            if duplicates > 1 and named:
-                return no_action("ambiguous_target")
-    return action
 
 
 class VoiceEngine:
@@ -184,11 +127,16 @@ class VoiceEngine:
             if len(tokens) > 1792:
                 raise ValueError("Canvas context is too large for the current demo.")
             result = predict(
-                self.model, self.tokenizer, command, canvas, history=history
+                self.model,
+                self.tokenizer,
+                command,
+                canvas,
+                history=history,
+                guarded=True,
             )
             if result["prediction"] is None:
                 raise ValueError("The model did not return a valid edit.")
-            action = execution_guard(command, result["prediction"], canvas, history)
+            action = result["prediction"]
             return {
                 "command": command,
                 "action": action,

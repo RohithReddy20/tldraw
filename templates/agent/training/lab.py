@@ -13,7 +13,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 
-from actions import INPUT_FORMAT_VERSION, SYSTEM_PROMPT, TOOLS, messages_for, parse_call
+from actions import (
+    INPUT_FORMAT_VERSION,
+    SYSTEM_PROMPT,
+    TOOLS,
+    execution_guard,
+    messages_for,
+    no_action,
+    parse_call,
+)
 from dataset import DATA, ROOT, dataset_hash, prepare_data, read_examples, training_row
 
 MODEL = "mlx-community/functiongemma-270m-it-bf16"
@@ -295,7 +303,9 @@ def _metadata():
     }
 
 
-def bundle_colab(resume=None):
+def bundle_colab(resume=None, *, warm_start=None):
+    if resume is not None and warm_start is not None:
+        raise ValueError("Choose an exact resume or a new run from adapter weights.")
     prepare_data()
     output = ROOT / "runs" / "canvas-training.zip"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +320,7 @@ def bundle_colab(resume=None):
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             archive.write(path, path.relative_to(ROOT))
-        warm_start = (
+        weights = warm_start or (
             resume / "adapter" / "adapters.safetensors"
             if resume
             else ROOT
@@ -319,11 +329,26 @@ def bundle_colab(resume=None):
             / "adapter"
             / "adapters.safetensors"
         )
-        archive.write(warm_start, "warm-start.safetensors")
+        archive.write(weights, "warm-start.safetensors")
+        if warm_start:
+            archive.write(
+                weights.parent / "adapter_config.json", "warm-adapter-config.json"
+            )
+            archive.writestr(
+                "warm-start.json",
+                json.dumps(
+                    {
+                        "initialization": "weights_only",
+                        "adapter_sha256": hashlib.sha256(
+                            weights.read_bytes()
+                        ).hexdigest(),
+                    }
+                ),
+            )
         if resume:
             checkpoint = json.loads((resume / "checkpoint.json").read_text())
             if (
-                hashlib.sha256(warm_start.read_bytes()).hexdigest()
+                hashlib.sha256(weights.read_bytes()).hexdigest()
                 != checkpoint["adapter_sha256"]
             ):
                 raise ValueError(
@@ -348,7 +373,9 @@ def bundle_colab(resume=None):
     print(f"Saved frozen training bundle to {output}")
 
 
-def predict(model, tokenizer, command, canvas, max_tokens=256, history=None):
+def predict(
+    model, tokenizer, command, canvas, max_tokens=256, history=None, *, guarded=False
+):
     import mlx.core as mx
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
@@ -390,6 +417,16 @@ def predict(model, tokenizer, command, canvas, max_tokens=256, history=None):
     except ValueError as error:
         result["prediction"] = None
         result["error"] = str(error)
+    if guarded:
+        result["raw_prediction"] = result["prediction"]
+        result["raw_error"] = result["error"]
+        if result["error"] == "Cannot remove a property that does not exist.":
+            result["prediction"] = no_action("missing_target")
+            result["error"] = None
+        if result["prediction"] is not None:
+            result["prediction"] = execution_guard(
+                command, result["prediction"], canvas, history or {}
+            )
     return result
 
 
@@ -407,6 +444,7 @@ def evaluate(args):
             example["command"],
             example["canvas"],
             history=example.get("history"),
+            guarded=getattr(args, "guarded", False),
         )
         result.update(
             {
@@ -427,6 +465,7 @@ def evaluate(args):
             "adapter": str(args.adapter) if args.adapter else None,
             "examples": rows,
             "evaluation_max_tokens": 256,
+            "execution_guards": getattr(args, "guarded", False),
         }
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +493,12 @@ def evaluate_sessions(args):
             oracle.external(step["before"])
             before = actual.snapshot()
             result = predict(
-                model, tokenizer, step["command"], actual.canvas, history=actual.history
+                model,
+                tokenizer,
+                step["command"],
+                actual.canvas,
+                history=actual.history,
+                guarded=getattr(args, "guarded", False),
             )
             created_id = f"{case['id']}:created-{turn}"
             try:
@@ -482,6 +526,7 @@ def evaluate_sessions(args):
         "split": args.split,
         "adapter": str(args.adapter),
         "mode": "closed_loop_predicted_state",
+        "execution_guards": getattr(args, "guarded", False),
         "examples": rows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -557,6 +602,7 @@ def main():
     commands.add_parser("inspect")
     bundle = commands.add_parser("bundle-colab")
     bundle.add_argument("--resume", type=Path)
+    bundle.add_argument("--warm-start", type=Path)
     train = commands.add_parser("train")
     train.add_argument("--run", default="first-lora")
     train.add_argument("--config", type=Path, default=ROOT / "config.yaml")
@@ -566,6 +612,7 @@ def main():
     evaluation.add_argument("--split", choices=["valid", "test"], default="test")
     evaluation.add_argument("--limit", type=positive_integer)
     evaluation.add_argument("--output", type=Path, required=True)
+    evaluation.add_argument("--guarded", action="store_true")
     session_evaluation = commands.add_parser("evaluate-sessions")
     session_evaluation.add_argument("--adapter", type=Path, required=True)
     session_evaluation.add_argument(
@@ -573,6 +620,7 @@ def main():
     )
     session_evaluation.add_argument("--limit", type=positive_integer)
     session_evaluation.add_argument("--output", type=Path, required=True)
+    session_evaluation.add_argument("--guarded", action="store_true")
     prediction = commands.add_parser("predict")
     prediction.add_argument("text")
     prediction.add_argument("--canvas", type=Path)
@@ -588,7 +636,7 @@ def main():
     elif args.command == "train":
         train_model(args)
     elif args.command == "bundle-colab":
-        bundle_colab(args.resume)
+        bundle_colab(args.resume, warm_start=args.warm_start)
     elif args.command == "evaluate":
         evaluate(args)
     elif args.command == "evaluate-sessions":

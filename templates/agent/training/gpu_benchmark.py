@@ -3,6 +3,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import signal
 import statistics
 import subprocess
@@ -212,6 +213,7 @@ def worker(root, output, case, verify=False, quality=False):
         completion_loss,
         packed_completion_loss,
         restore_random_state,
+        save_training_checkpoint,
     )
 
     settings = CASES[case]
@@ -240,12 +242,27 @@ def worker(root, output, case, verify=False, quality=False):
     model.load_weights(str(root / "warm-start.safetensors"), strict=False)
     if settings.get("dtype") == "float32":
         model.set_dtype(mx.float32)
-    restore_random_state(mx.load(str(root / "resume/random.safetensors"))["key"])
+    warm_start = (root / "warm-start.json").exists()
+    if warm_start:
+        np.random.seed(config["seed"])
+        mx.random.seed(config["seed"])
+    else:
+        restore_random_state(mx.load(str(root / "resume/random.safetensors"))["key"])
     checkpoint_layers(model, settings["checkpoint"])
     if quality:
-        resume = json.loads((root / "resume/progress.json").read_text())
+        if warm_start:
+            resume = {
+                **json.loads((root / "data/tokens.json").read_text()),
+                "step": 0,
+                "schedule_offset": 0,
+            }
+        else:
+            resume = json.loads((root / "resume/progress.json").read_text())
         raw_batches, batch_digest = quality_batches(
-            root / "data/tokens-train.npz", config["seed"], resume["step"]
+            root / "data/tokens-train.npz",
+            config["seed"],
+            resume["step"],
+            updates=config.get("quality_updates", 500),
         )
     else:
         raw_batches = representative_batches(root / "data/tokens-train.npz", verify)
@@ -319,12 +336,13 @@ def worker(root, output, case, verify=False, quality=False):
         optimizer = optim.Adam(
             learning_rate=lambda step: schedule(step + resume["schedule_offset"])
         )
-        optimizer.state = tree_unflatten(
-            list(mx.load(str(root / "resume/optimizer.safetensors")).items())
-        )
-        restored_step = int(optimizer.state["step"].item())
-        if restored_step + resume["schedule_offset"] != resume["step"]:
-            raise ValueError("Optimizer state does not match the retained update.")
+        if not warm_start:
+            optimizer.state = tree_unflatten(
+                list(mx.load(str(root / "resume/optimizer.safetensors")).items())
+            )
+            restored_step = int(optimizer.state["step"].item())
+            if restored_step + resume["schedule_offset"] != resume["step"]:
+                raise ValueError("Optimizer state does not match the retained update.")
         adapter_file = output / "adapter/adapters.safetensors"
         adapter_file.parent.mkdir(exist_ok=True)
         if rank == 0:
@@ -332,12 +350,17 @@ def worker(root, output, case, verify=False, quality=False):
             (output / "config.yaml").write_text(
                 yaml.safe_dump({**config, "model_dtype": "float16"}, sort_keys=False)
             )
+            if warm_start:
+                (output / "data").mkdir(exist_ok=True)
+                shutil.copyfile(root / "data/tokens.json", output / "data/tokens.json")
     else:
         optimizer = optim.Adam(learning_rate=3e-5)
         adapter_file = output / "benchmark-adapters.safetensors"
     reports = []
     updates, interval, warmup = (
-        (500, 50, 50) if quality else ((80, 8, 16) if verify else (24, 4, 12))
+        (config.get("quality_updates", 500), 50, 50)
+        if quality
+        else ((80, 8, 16) if verify else (24, 4, 12))
     )
     steady_started = None
 
@@ -347,6 +370,15 @@ def worker(root, output, case, verify=False, quality=False):
             reports.append(info)
             if info["iteration"] == warmup * accumulation:
                 steady_started = time.time()
+            if warm_start and rank == 0 and info["iteration"] % 500 == 0:
+                save_training_checkpoint(
+                    model,
+                    optimizer,
+                    adapter_file.parent,
+                    info["iteration"] // accumulation,
+                    0,
+                    archive=False,
+                )
 
     def iterator(**kwargs):
         while True:
@@ -407,10 +439,14 @@ def worker(root, output, case, verify=False, quality=False):
             warm_start_sha256=hashlib.sha256(
                 (root / "warm-start.safetensors").read_bytes()
             ).hexdigest(),
-            optimizer_sha256=hashlib.sha256(
+            optimizer_sha256=None
+            if warm_start
+            else hashlib.sha256(
                 (root / "resume/optimizer.safetensors").read_bytes()
             ).hexdigest(),
             model_revision="bb327a9ad61044e1496a2bee2365a6b6a6684c72",
+            initialization="weights_only" if warm_start else "exact_resume",
+            warm_start_source_step=config.get("warm_start_source_step"),
         )
     (output / "result.json").write_text(json.dumps(result, indent=2))
     print("RESULT " + json.dumps(result), flush=True)
@@ -636,13 +672,19 @@ def run_case(root, output, case, verify=False, quality=False):
     return compare(reference, folder)
 
 
-def quality_comparison(baseline, candidate):
+def quality_comparison(baseline, candidate, *, guarded=False):
     from sessions import summarize_sessions
 
     result = {}
     for name in ("valid", "sessions-valid"):
-        before = json.loads((baseline / f"{name}.json").read_text())
-        after = json.loads((candidate / f"{name}.json").read_text())
+        suffix = "-guarded" if guarded else ""
+        before = json.loads((baseline / f"{name}{suffix}.json").read_text())
+        after = json.loads((candidate / f"{name}{suffix}.json").read_text())
+        if (
+            before.get("execution_guards", False) != guarded
+            or after.get("execution_guards", False) != guarded
+        ):
+            raise ValueError("Raw and guarded accuracy reports must not be mixed.")
         old, new = before["examples"], after["examples"]
         if [(r["id"], r["command"], r["expected"]) for r in old] != [
             (r["id"], r["command"], r["expected"]) for r in new
@@ -706,6 +748,50 @@ def quality_comparison(baseline, candidate):
     return result
 
 
+def refinement_experiment(root, working):
+    import yaml
+
+    if not (root / "warm-start.json").exists():
+        raise ValueError("Refinement requires verified weights and a fresh optimizer.")
+    config = yaml.safe_load((root / "config.yaml").read_text())
+    output = working / "refinement"
+    baseline = output / "baseline"
+    (baseline / "adapter").mkdir(parents=True, exist_ok=False)
+    shutil.copyfile(
+        root / "warm-start.safetensors", baseline / "adapter/adapters.safetensors"
+    )
+    shutil.copyfile(
+        root / "warm-adapter-config.json", baseline / "adapter/adapter_config.json"
+    )
+    (baseline / "config.yaml").write_text(
+        yaml.safe_dump({**config, "model_dtype": "float16"})
+    )
+    trained = run_case(root, output, "dual-window", quality=True)
+    (working / "refinement-training.json").write_text(json.dumps(trained, indent=2))
+    if "error" in trained:
+        raise RuntimeError(
+            "Refinement training failed; the original adapter is retained."
+        )
+    evaluate_pair(root, output)
+    result = {
+        "raw": quality_comparison(baseline, output / "dual-window"),
+        "guarded": quality_comparison(baseline, output / "dual-window", guarded=True),
+        "training": trained,
+        "scope": (
+            "One targeted refinement from the retained 15,000-update model; "
+            "validation only."
+        ),
+    }
+    for mode in ("raw", "guarded"):
+        result[mode]["scope"] = result["scope"]
+    (working / "refinement-comparison.json").write_text(json.dumps(result, indent=2))
+    print(
+        "REFINEMENT COMPARISON "
+        + json.dumps({k: v for k, v in result.items() if k != "training"}),
+        flush=True,
+    )
+
+
 def quality_experiment(root, working):
     output = working / "quality"
     output.mkdir(exist_ok=True)
@@ -741,6 +827,23 @@ def quality_experiment(root, working):
     ):
         if training[0][key] != training[1][key]:
             raise ValueError(f"Paired training conditions differ in {key}.")
+    evaluate_pair(root, output)
+    result = quality_comparison(output / "baseline", output / "dual-window")
+    result["training"] = training
+    result["measured_speed_ratio"] = (
+        training[1]["updates_per_second"] / training[0]["updates_per_second"]
+    )
+    (working / "quality-comparison.json").write_text(json.dumps(result, indent=2))
+    print(
+        "QUALITY COMPARISON "
+        + json.dumps(
+            {key: value for key, value in result.items() if key != "training"}
+        ),
+        flush=True,
+    )
+
+
+def evaluate_pair(root, output):
     evaluations = []
     handles = []
     try:
@@ -795,23 +898,11 @@ def quality_experiment(root, working):
             process.wait()
         for log in handles:
             log.close()
-    result = quality_comparison(output / "baseline", output / "dual-window")
-    result["training"] = training
-    result["measured_speed_ratio"] = (
-        training[1]["updates_per_second"] / training[0]["updates_per_second"]
-    )
-    (working / "quality-comparison.json").write_text(json.dumps(result, indent=2))
-    print(
-        "QUALITY COMPARISON "
-        + json.dumps(
-            {key: value for key, value in result.items() if key != "training"}
-        ),
-        flush=True,
-    )
 
 
 def evaluate_quality(output):
     import mlx.core as mx
+    import yaml
 
     from lab import evaluate, evaluate_sessions
 
@@ -827,6 +918,22 @@ def evaluate_quality(output):
             )
         )
         mx.clear_cache()
+    config = yaml.safe_load((output / "config.yaml").read_text())
+    if config.get("evaluate_guards"):
+        for function, name in (
+            (evaluate, "valid"),
+            (evaluate_sessions, "sessions-valid"),
+        ):
+            function(
+                argparse.Namespace(
+                    split="valid",
+                    adapter=output / "adapter",
+                    output=output / f"{name}-guarded.json",
+                    limit=None,
+                    guarded=True,
+                )
+            )
+            mx.clear_cache()
 
 
 def benchmark(root, working, cases=None):

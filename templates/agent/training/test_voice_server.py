@@ -5,7 +5,8 @@ from http.server import HTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from voice_server import CommandRequest, execution_guard, handler_for
+from actions import execution_guard
+from voice_server import CommandRequest, handler_for
 
 
 class VoiceGuardTests(unittest.TestCase):
@@ -38,6 +39,42 @@ class VoiceGuardTests(unittest.TestCase):
                 "Add email to it and move the box.", self.action, self.canvas, {}
             ),
             {"name": "no_action", "arguments": {"reason": "unsupported_request"}},
+        )
+
+    def test_compound_request_has_priority_over_a_wrong_no_action_reason(self):
+        self.assertEqual(
+            execution_guard(
+                "Add email to User and move the box.",
+                {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+                self.canvas,
+                {},
+            ),
+            {"name": "no_action", "arguments": {"reason": "unsupported_request"}},
+        )
+
+    def test_selected_target_requires_one_selection_and_named_targets_override_it(self):
+        self.canvas["schemas"][1]["name"] = "Account"
+        for selection in ([], ["first", "second"]):
+            self.canvas["selected_ids"] = selection
+            with self.subTest(selection=selection):
+                self.assertEqual(
+                    execution_guard(
+                        "Append email to the selected class.",
+                        self.action,
+                        self.canvas,
+                        {},
+                    ),
+                    {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+                )
+                self.assertEqual(
+                    execution_guard("Add email to User.", self.action, self.canvas, {}),
+                    self.action,
+                )
+        self.assertEqual(
+            execution_guard(
+                "Add email to the selected box.", self.action, {"schemas": []}, {}
+            ),
+            {"name": "no_action", "arguments": {"reason": "missing_target"}},
         )
 
     def test_method_lists_are_not_mistaken_for_a_second_edit(self):

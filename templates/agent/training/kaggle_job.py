@@ -17,6 +17,22 @@ def extract_bundle(bundle, root, digest):
             if path.is_absolute() or ".." in path.parts:
                 raise ValueError("Invalid path in training bundle.")
         archive.extractall(root)
+    if (root / "warm-start.json").exists():
+        warm = json.loads((root / "warm-start.json").read_text())
+        if (
+            warm["initialization"] != "weights_only"
+            or hashlib.sha256(
+                (root / "warm-start.safetensors").read_bytes()
+            ).hexdigest()
+            != warm["adapter_sha256"]
+        ):
+            raise ValueError("Refinement starting weights failed verification.")
+        if (root / "resume.json").exists():
+            raise ValueError(
+                "Refinement must not restore the previous dataset's optimizer."
+            )
+        print("Verified adapter weights for a new refinement run.", flush=True)
+        return
     resume = json.loads((root / "resume.json").read_text())
     if (
         hashlib.sha256((root / "warm-start.safetensors").read_bytes()).hexdigest()
@@ -34,14 +50,14 @@ def main():
     parser.add_argument("--train", action="store_true")
     parser.add_argument(
         "--task",
-        choices=("train", "benchmark", "quality"),
+        choices=("train", "benchmark", "quality", "refine"),
         default=globals().get("TASK", "train"),
     )
     args = parser.parse_args()
     os.environ["MLX_CUDA_GRAPH_CACHE_SIZE"] = "4096"
     # Production resumes on one T4; experiments can measure both allocated devices.
     os.environ["CUDA_VISIBLE_DEVICES"] = (
-        "0,1" if args.task in ("benchmark", "quality") else "0"
+        "0,1" if args.task in ("benchmark", "quality", "refine") else "0"
     )
     working = Path("/kaggle/working")
     root = working / "canvas-training"
@@ -54,6 +70,10 @@ def main():
             from gpu_benchmark import quality_experiment
 
             quality_experiment(root, working)
+        elif args.task == "refine":
+            from gpu_benchmark import refinement_experiment
+
+            refinement_experiment(root, working)
         else:
             from colab_job import train_job
 

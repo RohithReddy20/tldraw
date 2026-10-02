@@ -91,7 +91,9 @@ def restore_random_state(key):
     mx.random.seed((high << 32) | low)
 
 
-def save_training_checkpoint(model, optimizer, adapter, step, schedule_offset):
+def save_training_checkpoint(
+    model, optimizer, adapter, step, schedule_offset, *, archive=True
+):
     import mlx.core as mx
     from mlx.utils import tree_flatten
 
@@ -118,6 +120,9 @@ def save_training_checkpoint(model, optimizer, adapter, step, schedule_offset):
             }
         )
     )
+    if not archive:
+        print(f"Global step {step}: Saved resumable checkpoint.", flush=True)
+        return
     archive_path = checkpoint / "checkpoint.zip"
     with zipfile.ZipFile(
         archive_path, "w", compression=zipfile.ZIP_DEFLATED

@@ -673,6 +673,103 @@ def build_examples(seed=42):
     return examples
 
 
+def build_refinement(source, seed=54, replay_count=16000, pairs=6000):
+    from build_sessions import FIELDS, NAMES
+
+    original = [
+        json.loads(line) for line in source.read_text().splitlines() if line.strip()
+    ]
+    rng = random.Random(seed)
+    train = [row for row in original if row["split"] == "train"]
+    replay = rng.sample(train, min(replay_count, len(train)))
+    examples = json.loads(json.dumps(replay))
+    for row in examples:
+        row["id"] = "v5-replay-" + row["id"]
+        row["group"] = "v5-replay-" + row["group"]
+    add_phrases = (
+        "Add {field} to {target}.",
+        "Put a property called {field} in {target}.",
+        "Include the field {field} on {target}.",
+        "Give {target} a new attribute named {field}.",
+    )
+    remove_phrases = (
+        "Remove {field} from {target}.",
+        "Delete the property {field} on {target}.",
+        "Drop the field {field} from {target}.",
+    )
+    extra_edits = (
+        " and move it to the right",
+        " and then rotate the box",
+        " and color that schema blue",
+        " and rename it to Revised",
+        "; then reposition the class above its neighbor",
+        "; after that, delete the entire box",
+        " and also connect it to another schema",
+        " and make the box wider",
+    )
+    for index in range(pairs):
+        names = rng.sample(NAMES["train"], 3)
+        identifiers = [f"refine-{index}-box-{j}" for j in range(3)]
+        field, missing = rng.sample(FIELDS, 2)
+        properties = rng.sample([x for x in FIELDS if x not in (field, missing)], 4)
+        canvas = {
+            "schemas": [
+                {"id": identifier, "name": name, "properties": list(properties)}
+                for identifier, name in zip(identifiers, names, strict=True)
+            ],
+            "selected_ids": [identifiers[1]],
+        }
+        target = names[0]
+        command = rng.choice(add_phrases).format(field=field, target=target)
+        compound = command.rstrip(".") + rng.choice(extra_edits) + "."
+        remove = rng.choice(remove_phrases).format(field=missing, target=target)
+        present = json.loads(json.dumps(canvas))
+        present["schemas"][0]["properties"].append(missing)
+        selected = rng.choice(add_phrases).format(
+            field=field, target="the selected box"
+        )
+        ambiguous = json.loads(json.dumps(canvas))
+        ambiguous["selected_ids"] = [] if index % 2 else identifiers[:2]
+        cases = (
+            (
+                command,
+                canvas,
+                "add_property",
+                {"schema_id": identifiers[0], "property_name": field},
+            ),
+            (compound, canvas, "no_action", {"reason": "unsupported_request"}),
+            (
+                remove,
+                present,
+                "remove_property",
+                {"schema_id": identifiers[0], "property_name": missing},
+            ),
+            (remove, canvas, "no_action", {"reason": "missing_target"}),
+            (
+                selected,
+                canvas,
+                "add_property",
+                {"schema_id": identifiers[1], "property_name": field},
+            ),
+            (selected, ambiguous, "no_action", {"reason": "ambiguous_target"}),
+        )
+        for kind, (command, context, name, arguments) in enumerate(cases):
+            row = record(
+                "train",
+                f"v5-refinement-{index}",
+                kind,
+                command,
+                context,
+                name,
+                arguments,
+            )
+            row.update(id=f"v5-hard-{index}:{kind}", group=f"v5-hard-{index}")
+            examples.append(row)
+    examples.extend(row for row in original if row["split"] != "train")
+    audit_examples(examples)
+    return examples
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build the expanded canvas action dataset."
@@ -681,15 +778,27 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--train-sessions", type=int, default=2000)
+    parser.add_argument("--refine-from", type=Path)
+    parser.add_argument("--replay-count", type=int, default=16000)
+    parser.add_argument("--hard-pairs", type=int, default=6000)
     args = parser.parse_args()
     if args.output.exists() and not args.replace:
         raise SystemExit("Output already exists; use --replace to regenerate it.")
-    from build_sessions import build_large_dataset
+    if args.refine_from:
+        if args.output.resolve() == args.refine_from.resolve():
+            raise SystemExit("Refinement must preserve its original source dataset.")
+        examples = build_refinement(
+            args.refine_from, args.seed, args.replay_count, args.hard_pairs
+        )
+        session_path = args.refine_from.parent / "sessions.jsonl"
+        (args.output.parent / "sessions.jsonl").write_bytes(session_path.read_bytes())
+    else:
+        from build_sessions import build_large_dataset
 
-    examples, sessions = build_large_dataset(args.seed, args.train_sessions)
-    (args.output.parent / "sessions.jsonl").write_text(
-        "".join(json.dumps(session) + "\n" for session in sessions)
-    )
+        examples, sessions = build_large_dataset(args.seed, args.train_sessions)
+        (args.output.parent / "sessions.jsonl").write_text(
+            "".join(json.dumps(session) + "\n" for session in sessions)
+        )
     contents = "".join(json.dumps(example) + "\n" for example in examples)
     args.output.write_text(contents)
     print(
