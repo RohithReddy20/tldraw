@@ -105,6 +105,16 @@ def finish_workflow(kernel, directory):
     from gpu_benchmark import quality_comparison
 
     download = directory / "download"
+    launch = json.loads((directory / "run.json").read_text())
+    final_step = f"{launch['updates']:07d}"
+    pattern = (
+        r"^refinement-[^/]+\.json$|^refinement/(?:baseline|dual-window)/"
+        r"(?:[^/]+\.(?:json|yaml|log|csv)|data/tokens\.json|adapter/"
+        r"(?:adapters\.safetensors|adapter_config\.json|checkpoints/"
+        + final_step
+        + r"/(?:adapters\.safetensors|optimizer\.safetensors|"
+        r"random\.safetensors|progress\.json)))$"
+    )
     cli(
         "kernels",
         "output",
@@ -112,12 +122,11 @@ def finish_workflow(kernel, directory):
         "--path",
         str(download),
         "--file-pattern",
-        r"^refinement(?:/|-)",
+        pattern,
         "--page-size",
         "200",
         timeout=1200,
     )
-    launch = json.loads((directory / "run.json").read_text())
     candidate = download / "refinement/dual-window"
     result = json.loads((download / "refinement-training.json").read_text())
     for key, expected in (
