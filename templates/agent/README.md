@@ -18,11 +18,702 @@ We recommend using Anthropic for best results. Get your API key from the [Anthro
 
 ## Local development
 
-Install dependencies with `npm install`.
+From the monorepo root, install dependencies with `pnpm install`.
 
-Run the development server with `npm run dev`.
+Run the development server with `pnpm --filter tldraw-agent dev`.
 
 Open `http://localhost:5173/` in your browser to see the app.
+
+## Local voice canvas
+
+Open `http://localhost:5173/?mode=local-voice` for silent speech-to-canvas commands.
+The browser records audio when you press **Speak**; press **Finish recording** to
+apply it. Recordings stop automatically at 60 seconds. A text input uses the same
+action model. This mode uses local Parakeet speech recognition and the trained
+FunctionGemma 270M adapter, with no paid inference API or spoken replies.
+
+Start the service in a second terminal from the monorepo root:
+
+```sh
+uv run --project templates/agent/training --extra voice python templates/agent/training/voice_server.py \
+  --adapter templates/agent/training/runs/colab-270m-v4-sessions-checkpoint-5000/adapter
+```
+
+The adapter must already exist. The service requires FFmpeg and the locally cached
+`mlx-community/parakeet-tdt-0.6b-v2` model. On this machine the Parakeet weights were
+already cached. To prepare another machine, download them once:
+
+```sh
+uv run --project templates/agent/training --extra voice python -c \
+  'from huggingface_hub import snapshot_download; snapshot_download("mlx-community/parakeet-tdt-0.6b-v2", token=False)'
+```
+
+Try creating a User schema with properties name, class, subjects and methods
+getName, getClass, getSubjects, addSubject, removeSubject. Then add a property,
+remove one, rename the box, or connect it to another schema. Successful edits
+select their target; the next command can refer to that selection. Current schema
+contents, the last three outcomes, and stable last-created/last-edited IDs go to
+the model on each request. Canvas contents persist locally; outcome memory resets
+on page reload. Other tldraw shape types are excluded from the model's context.
+
+The service validates every function call. The browser checks target IDs, field
+existence, limits, and whether the canvas changed before applying an edit. One edit
+forms one undo step. Connections use tldraw arrow bindings. Additional execution
+guards reject known duplicate-name, deleted-reference, and compound-edit failure
+patterns; these guards do not change the raw model benchmark scores. They do not
+guarantee that every misunderstanding is caught. Audio conversion files are temporary.
+
+This is a prototype with six actions. Adding/removing methods, arbitrary styling,
+undo by voice, and multiple edits in one utterance are not supported. There are at
+most 30 schema boxes and 30 fields or methods per box, and the service rejects
+prompts that exceed its 2,048-token budget. The current adapter still makes errors
+in long sessions; see the validation results below.
+
+## Local action-model training
+
+The `training/` directory is a Python lab for learning to fine-tune a small instruction
+model. It translates text commands and canvas context into one validated function
+call. The local voice mode above connects that call to speech and the tldraw editor.
+
+The lab uses Python 3.12, `uv`, MLX-LM, and a pinned MLX conversion of
+[FunctionGemma 270M](https://huggingface.co/mlx-community/functiongemma-270m-it-bf16).
+Training and inference run on an Apple Silicon Mac without a paid inference API.
+The checkpoint retains the Gemma license.
+
+Run these commands from the monorepo root. Install
+[uv](https://docs.astral.sh/uv/getting-started/installation/) if it is missing.
+
+```sh
+uv sync --project templates/agent/training --python 3.12
+uv run --project templates/agent/training python templates/agent/training/build_dataset.py --replace --seed 43
+uv run --project templates/agent/training python templates/agent/training/lab.py inspect
+```
+
+`examples.jsonl` contains 123,851 synthetic examples: 122,530 training, 470 validation,
+and 851 test examples. Each line contains a command, canvas context, recent outcomes,
+the expected function call, and a scenario group. `sessions.jsonl` contains replayable
+sessions: 2,000 training sessions of 12–80 turns, eight validation sessions totaling
+300 turns, and 16 test sessions totaling 600 turns. Both generated files are ignored
+by Git; regenerate them using the command above. Add reviewed scenarios to the generator.
+Keep paraphrases of the same scenario in the same split. Training uses examples to
+update weights; validation helps choose settings; the test split measures the final
+chosen model. These examples are a controlled learning exercise, not a benchmark of
+natural speech or general diagram editing. `build_dataset.py` defines the entity
+catalogue, phrasing, and deterministic labels; the current seed is 43. Train, validation,
+and test sets have separate target entity names and phrasing. Entire sessions stay
+in one split, and the audit rejects identical inputs across splits.
+Regeneration replaces manual edits, so keep reviewed additions in the generator or
+save a copy of the JSONL file first.
+
+Version four retires all version-three examples into training. Fresh held-out
+entities and phrasing are used for validation and test. Fields and methods are
+sampled independently for each canvas, including plural, camelCase, snake_case,
+acronym, and numbered identifiers. Counterfactual removal pairs keep the command
+constant while adding or removing the requested field from the canvas. Sessions
+include sequential additions, removals, renames, connections, corrections, references
+to recent edits, duplicate names, missing targets, selection changes, manual deletions,
+and box reordering. Unsupported questions and compound requests must produce `no_action`.
+
+The actions create a schema box, add or remove a property, rename a schema, connect
+schemas, or return `no_action` for a missing or ambiguous target or unsupported request.
+The `create_schema_box` argument `fields` represents the box's properties. FunctionGemma's
+chat template reserves `properties` while formatting schemas, so using `fields` keeps
+this argument visible in the tool declaration. Existing canvas boxes still use
+`properties`. Methods and field names retain their requested spelling and order.
+The model sees temporary IDs such as `box1` and `box2`, plus an explicit selection
+status. The parser maps those IDs back to real canvas IDs before validating an action.
+This removes long ID copying from the model's task while retaining exact target checks.
+
+`CanvasSession` maintains the current canvas and connections, stable IDs of the last
+created and edited boxes, and three recent command outcomes. IDs in this memory are
+mapped against the current canvas on every turn; reordering cannot silently change
+a reference, and a deleted target becomes missing. Successful edits select their
+target. A named target overrides selection, while "it" uses a single current selection.
+Explicit "last created" and "last edited" references use session memory.
+The model still produces one action per turn. Arbitrary conversation recall, undo,
+method edits, styling, and multiple edits in one utterance are outside this action
+contract. `CanvasSession` supplies the Python evaluation simulation; the local
+voice mode executes the same action contract in the live tldraw editor.
+
+The inspector audits labels, conflicting annotations, and splits, displays the model's actual prompt, measures
+token lengths, and checks that prompt masking and function-call parsing agree with
+the tokenizer. In training, prompt masking computes loss on the expected answer.
+
+First, measure the original model on validation examples:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py evaluate \
+  --split valid --output templates/agent/training/runs/baseline-valid.json
+```
+
+Next, train an adapter. Choose a new run name for every experiment:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py train \
+  --run my-first-lora
+```
+
+`training/config.yaml` specifies 15,000 steps, batch size 8, a 200-update learning
+rate warmup to 0.00003 followed by cosine decay to 0.000003, LoRA rank 32 with scale
+8, gradient checkpointing, and a 2,048-token sequence limit. The longest current
+example is 1,444 tokens. This processes 120,000 examples, nearly one pass over training.
+The Colab job starts from the final version-three adapter; this initializes weights
+but starts a fresh optimizer. Its checksum is saved in the experiment metadata.
+The Python trainer projects only completion positions to vocabulary logits and
+excludes padding from loss. A numerical test checks loss and gradients against a
+full projection. Token arrays use compact storage, and batches are sorted by actual
+token lengths. These changes reduce memory needed for the longer session prompts.
+The inspector saves token arrays with dataset and task checksums. Colab verifies
+those checksums and uses the prepared tokens, avoiding another full tokenization
+pass on the GPU runtime. The longest completion has 83 tokens; the loss window is 96.
+LoRA freezes the base model and trains adapter matrices across its transformer layers.
+Rank controls adapter capacity; learning rate controls update size; steps control how
+many updates run. Training and validation loss, memory use, and throughput appear
+in `runs/my-first-lora/training.log`. Adapter weights and checkpoints are saved under
+`runs/my-first-lora/adapter/`. `--iters 20` gives a shorter practice run.
+Use `--config path/to/config.yaml` to run a separate configuration. Each experiment
+saves its configuration, dataset, and task definition alongside the adapter.
+
+Evaluate the adapter on the same validation examples and compare:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py evaluate \
+  --split valid --adapter templates/agent/training/runs/my-first-lora/adapter \
+  --output templates/agent/training/runs/my-first-lora/valid.json
+uv run --project templates/agent/training python templates/agent/training/lab.py compare \
+  templates/agent/training/runs/baseline-valid.json \
+  templates/agent/training/runs/my-first-lora/valid.json
+```
+
+Reports include exact action accuracy, valid call rate, tool selection accuracy,
+latency, peak MLX memory, and each raw prediction and error. Exact accuracy checks
+the complete action and its arguments, including target IDs and list order. The
+memory measurement covers MLX allocations, not total system RAM. Reports also record
+the model revision, dependency version, and hashes of the dataset and task definition.
+Use raw errors and validation results to improve data or settings. Lower loss alone
+does not establish correct actions.
+
+Training's periodic loss check uses 32 validation batches. The `evaluate` command
+generates and checks complete actions on every example in the chosen split unless
+you pass `--limit`. Choose the adapter using these complete-action results.
+
+When you have chosen an adapter, run both evaluations with `--split test` and new
+output paths. Keep test results out of decisions about that experiment's training.
+
+Try your own text command:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py predict \
+  'Create a User schema with properties name, class, subjects and methods getName, getClass, getSubjects, addSubject, removeSubject.' \
+  --adapter templates/agent/training/runs/my-first-lora/adapter
+```
+
+For edits, pass `--canvas path/to/canvas.json` with a `schemas` array of objects
+containing `id`, `name`, `properties`, and `methods`, plus `selected_ids`. The model
+receives that context each time. Unknown IDs, extra arguments, incomplete calls,
+and attempts to remove a missing property fail validation. A valid call can still
+misinterpret the command, which is why semantic evaluation is necessary.
+
+Single-turn evaluation supplies the correct saved canvas and history for every
+example. Session evaluation instead executes the model's predictions against its
+own evolving state. It never replaces an incorrect canvas with the expected state.
+Reports measure exact action accuracy, current state agreement, completely correct
+sessions, final state agreement, unwanted mutations on `no_action` requests, recovery,
+and accuracy in ten-turn intervals:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py evaluate-sessions \
+  --split valid --adapter templates/agent/training/runs/my-first-lora/adapter \
+  --output templates/agent/training/runs/my-first-lora/sessions-valid.json
+```
+
+Synthetic results do not establish reliability on real speech or unrestricted
+canvas edits. The session tests measure supported actions for up to 80 turns; they
+do not establish how long accuracy remains stable beyond that range.
+
+The Python environment, generated training data, reports, and adapters are ignored
+by Git. Check the lab without running a model:
+
+```sh
+uv run --project templates/agent/training ruff check templates/agent/training
+uv run --project templates/agent/training python -m unittest discover \
+  -s templates/agent/training -p 'test_*.py'
+```
+
+See the [MLX-LM training guide](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
+and Google's [FunctionGemma fine-tuning tutorial](https://ai.google.dev/gemma/docs/functiongemma/finetuning-with-functiongemma)
+for the underlying training tools and model formatting.
+
+### Colab training
+
+Install Google's CLI and complete its Google sign-in flow in your terminal:
+
+```sh
+uv tool install google-colab-cli
+colab --auth=oauth2 sessions
+```
+
+Paste Google's authorization code into the terminal prompt. Enter commands without
+surrounding shell backticks. GPU allocation depends on your Colab account and quota.
+
+Bundle the current lab and data, allocate a T4, and upload the bundle:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py bundle-colab
+colab --auth=oauth2 new -s canvas-270m-v4-large --gpu T4
+for bundle_part in templates/agent/training/runs/canvas-training.zip.part-*; do
+  colab --auth=oauth2 upload -s canvas-270m-v4-large \
+    "$bundle_part" "/content/${bundle_part##*/}"
+done
+```
+
+Run the job, which installs CUDA training dependencies in an isolated environment:
+
+```sh
+colab --auth=oauth2 exec -s canvas-270m-v4-large --timeout 43200 \
+  -f templates/agent/training/colab_job.py
+```
+
+The job retains FunctionGemma 270M, converts its checkpoint to FP16 for T4 training,
+and saves the adapter, configuration, dataset snapshot, hardware, log, and validation
+and session validation reports. Training runs directly in the notebook kernel, with
+checkpoints saved every 500 updates. The bundle includes the version-three final
+adapter as the warm start. It refuses to train if the MLX GPU backend is unavailable.
+The test set is
+reserved for the chosen adapter. Extract the results zip into `training/runs/`;
+the local prediction command reads the saved dtype and recreates the FP16 base
+checkpoint before loading the adapter.
+Uploads and final downloads use 16 MB parts because the CLI sends files in an
+encoded request. The job reassembles uploads; `colab_follow.py` verifies checksums
+while reassembling results, then stops the GPU before local test evaluation.
+
+### Session experiment
+
+The version-four experiment uses the final version-three adapter as a warm start,
+the 122,530-example training split, and a target of 15,000 batch-eight updates on
+a Tesla T4. Its console is captured in
+`training/runs/colab-270m-v4-sessions-console.log`. The job generates both validation
+reports before packaging results. The latest complete local backup is update
+5,000, including adapter weights, optimizer, random state, and dataset/task
+checksums. The runtime reached update 5,500 before disappearing again; its final
+backup was incomplete. The last training report measured 0.817 updates/second and
+4.038 GB peak MLX allocations. The October 1 recovery attempts returned
+`Service Unavailable` for all four replacement T4 allocations. The delayed recovery
+window also failed all four allocation attempts; its log is
+`runs/v4-recovery-delayed.log`. No Colab GPU remains active. The 15,000-update target
+and fresh test evaluation remain pending.
+`colab_follow.py` backs up every 500-update checkpoint, including weights, optimizer
+and random state. It checks remote liveness every two minutes and permits up to two
+automatic recoveries from the newest verified checkpoint. A `Service Unavailable`
+allocation response allows three delayed retries; other allocation errors stop
+recovery. It downloads final
+results, stops the GPU, and runs the fresh tests locally. Run it in
+a second terminal while the Colab execution remains active:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/colab_follow.py --session canvas-270m-v4-recover-r1
+```
+
+The initial large session reached update 2,400 before its runtime disappeared.
+The server reported no active session, without a termination reason. The old monitor
+missed that disappearance and retained only update 500; its log is preserved in
+`runs/colab-270m-v4-sessions-interrupted-2400-console.log`. The recovery job is
+`canvas-270m-v4-recover`, using the verified update-500 weights and the same dataset.
+Its target remains 15,000 total updates, with completed batches skipped and the
+learning-rate schedule continued from update 500. This older backup has no optimizer
+state, so the first recovery restarts the optimizer. Subsequent backups retain it.
+The corrected recovery path passed one real optimizer update; checkpoint tests also
+verify that restoring optimizer state produces the same next update. All 22 lab
+checks passed. The retained update-500 checkpoint scored 292/470 exact validation
+actions (62.1%), compared with 213/470 (45.3%) before the larger run. Its valid-call
+rate was 461/470 (98.1%). This interim measurement uses the unchanged validation
+cases; final test accuracy and closed-loop session reliability remain pending.
+The report is `runs/v4-retained-500-valid.json`.
+
+Update 4,000 was evaluated on the unchanged validation split:
+
+| Measurement                                           | Before the large run | Update 4,000    |
+| ----------------------------------------------------- | -------------------- | --------------- |
+| Exact single-command actions                          | 213/470 (45.3%)      | 361/470 (76.8%) |
+| Exact closed-loop actions                             | 120/300 (40.0%)      | 223/300 (74.3%) |
+| Matching canvas states                                | 35/300 (11.7%)       | 71/300 (23.7%)  |
+| Perfect sessions                                      | 0/8                  | 1/8             |
+| Matching final session states                         | 0/8                  | 2/8             |
+| Unwanted mutations on 140 expected no-action requests | 28                   | 37              |
+
+All 51 schema-creation validation cases passed. Supported edits scored 210/219
+(95.9%), while `no_action` scored 151/251 (60.2%). Long-session state agreement
+remains weak: errors accumulate, and unwanted edits increased. These are interim
+raw model results, without the serving guards. The reports are
+`runs/v4-retained-4000-valid.json` and `runs/v4-retained-4000-sessions-valid.json`.
+The fresh 851 single-command test cases and 600 session test turns remain unused.
+
+The local voice integration adds six passing checks for execution guards, deleted
+history IDs, request validation, and local origins. Browser checks exercised a
+synthetic microphone recording through Parakeet and the adapter into a real canvas,
+plus all five editing tools and no-action cases. They verify the integration path,
+not general model accuracy. That browser session also exposed model errors: an
+unrequested method on one schema and a changed connection label. The model remains
+a prototype; natural microphone noise and accents are not benchmarked yet.
+
+To create a recovery bundle from a verified local checkpoint:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py bundle-colab \
+  --resume templates/agent/training/runs/colab-270m-v4-sessions-checkpoint-500
+```
+
+The first attempt failed on a helper import before any optimizer updates; its
+console is preserved as `runs/colab-270m-v4-sessions-attempt1-console.log`.
+The corrected trainer passed a real cached batch-eight update locally with 2.84 GB
+peak MLX memory. A NumPy integer conversion error in the first cached attempt was
+fixed and rechecked through the exact training path before retrying. CUDA also
+required `MLX_CUDA_GRAPH_CACHE_SIZE=4096` for the larger compiled training graph;
+the bootstrap and Colab job set it before MLX initialization.
+
+Before training, the version-three adapter was evaluated with the new prompt and
+new validation cases: 213/470 exact actions (45.3%). On eight closed-loop validation
+sessions it made 120/300 correct actions (40.0%); none of the eight sessions or
+their final states was completely correct. It made 28 unwanted mutations across
+140 expected `no_action` requests. The reports are `runs/v4-baseline-valid.json`
+and `runs/v4-baseline-sessions-valid.json`. These scores measure a harder task with
+new session context; they are not directly comparable with version three's old
+single-command test score. The same validation cases will measure the new adapter.
+
+### Kaggle recovery
+
+The October 1 Kaggle recovery uses the verified update-5,000 checkpoint and the
+unchanged 122,530 training examples. The target remains 15,000 total updates.
+Both the input dataset and training notebook are private. Kaggle allocated two
+Tesla T4 GPUs with 15,360 MiB each and driver 580.178.04; this trainer uses device
+zero. It passed real CUDA forward and backward checks. The first two launcher
+attempts failed during environment setup. The third passed CUDA checks but exposed
+MLX 0.32.3's read-only random-state API during restoration. The fourth fixes both
+library precedence and random-state restoration, and has entered training with the
+optimizer and random state restored. A regression check verifies that restoring a
+saved random key reproduces the next random draws exactly.
+The first progress report confirms update 5,100: 100 new updates completed, with
+training loss 0.009 and peak MLX memory of 4.111 GB. The recovered job completed
+15,000 updates, and the result monitor verified and retained its final checkpoint.
+
+`training/kaggle_job.py` verifies the input bundle and retained weights, restores
+optimizer and random state, and runs the existing MLX trainer in an isolated Python
+3.12 environment. Checkpoints are saved every 500 updates in the Kaggle outputs.
+`training/kaggle_follow.py` monitors the batch job, verifies the downloaded archive
+checksums and completed update count, and checks the frozen source and dataset
+before evaluating the fresh tests locally. Training stays on Kaggle.
+
+The completed run is
+<https://www.kaggle.com/code/rohithresearch/canvas-270m-v4-training>.
+Its local launch record and logs are under `training/runs/kaggle/`. Follow progress:
+
+```sh
+kaggle kernels status rohithresearch/canvas-270m-v4-training
+kaggle kernels logs rohithresearch/canvas-270m-v4-training --follow
+```
+
+The local result monitor runs independently of this terminal. To resume monitoring:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \
+  --kernel rohithresearch/canvas-270m-v4-training
+```
+
+Completed reports are saved under
+`training/runs/kaggle/download/colab-270m-v4-sessions/`. The run directory retains its
+original Colab name for artifact compatibility. The completed model scored
+441/470 validation commands (93.8%). It correctly handled 218/219 supported
+actions and 223/251 requests requiring `no_action`. In closed-loop validation,
+284/300 actions matched (94.7%), but canvas state matched on only 75/300 turns
+(25%). Four of eight sessions had no action errors; nine unsupported or missing
+requests caused unwanted changes.
+
+On the reserved test set, the completed model matched 765/851 commands (89.9%),
+with valid calls on 98.6% and correct tool selection on 95.7%. Its 16 closed-loop
+test sessions contained 600 turns: 487 actions matched (81.2%), canvas state
+matched on 187 turns (31.2%), three sessions had no action errors, and three ended
+with the expected canvas. There were 25 unwanted mutations on 289 unsupported or
+missing requests. These are raw model results; runtime guards are not included.
+The drop in matching canvas state during longer sessions remains a measured gap.
+
+#### GPU speed measurement
+
+The October 2 speed check ran separately on Kaggle with the same 270M model,
+FP16 base, rank-32 LoRA, retained update-5,000 weights, and completion loss. Each
+case ran in a fresh process with a four-minute limit; the notebook had a
+15-minute limit. It alternated batch-eight inputs of 1,153 and 1,473 tokens for
+24 updates, excluded the first 12 updates for compilation warmup, and reported
+the median of the remaining three four-update intervals.
+
+| Settings                            | Updates/second | Examples/second | Result                             |
+| ----------------------------------- | -------------: | --------------: | ---------------------------------- |
+| Current settings                    |          0.703 |            5.63 | Baseline                           |
+| Retain up to 4 GiB of memory cache  |          0.686 |            5.49 | No measured speed improvement      |
+| Also disable gradient checkpointing |              — |               — | CUDA out of memory during training |
+
+The two successful cases produced identical initial loss and gradients on a
+single longest-context example. These short, controlled measurements do not
+establish the fastest possible configuration or predict a complete training run.
+They do not justify changing the current settings. The active training job
+continued throughout the check; neither its configuration nor checkpoint was
+replaced. Using both allocated GPUs would require a distributed trainer.
+
+The benchmark is
+<https://www.kaggle.com/code/rohithresearch/canvas-270m-t4-throughput>.
+The downloaded results and traceback are under
+`training/runs/kaggle/throughput-download/`. Reproduce the bounded cases with
+`training/gpu_benchmark.py` through `training/kaggle_job.py --task benchmark`.
+
+Subsequent notebook versions expanded the comparison to effective batch eight,
+full-batch gradient checks, two GPUs, and an 80-update verification workload with
+eight sequence lengths. Version 2 measured 0.743 updates/second for the verified
+baseline. Padding accounted for only 1.4% of input tokens. Gathering only actual
+answer positions, changing checkpoint coverage, and accumulating smaller batches
+did not produce a verified improvement. Some changes produced similar initial
+losses but materially different FP16 gradients.
+
+Version 3 repeated the baseline gradient calculation exactly and measured 0.750
+updates/second on the longer verification workload. A two-GPU PyTorch trial
+measured 0.927 updates/second versus 0.647 for that version's short baseline trial,
+but failed the gradient comparison. That trial also used PyTorch's default Adam
+bias correction, unlike the production MLX optimizer, so its training trajectory
+is not equivalent. The experimental runner now cancels that correction and checks
+the first update against the MLX Adam formula. Neither trial changed production.
+
+Version 4 tested the corrected optimizer, full-precision gradient references,
+compilation, and structured sliding-window attention. The two-GPU MLX trial ran
+at 1.312 updates/second versus 0.719 for its short single-GPU baseline, but its
+FP16 gradients differed by 48.2% relative L2. The full-precision PyTorch trial
+matched the MLX full-precision reference within 0.0068% relative L2 and checked
+the optimizer update within 3.8e-9, but ran at 0.492 updates/second. The longer
+baseline verification measured 0.768 updates/second.
+
+On that low-loss longest-context batch, the single- and two-GPU FP16 gradients
+differed from the full-precision reference by 92.8% and 70.8% relative L2,
+respectively. A difference from the original FP16 calculation therefore does not
+establish worse task accuracy. These measurements cover one initial gradient
+calculation, not convergence or command accuracy.
+
+Version 5 completed the bounded search with a supported xFormers mask and checks
+for finite training losses and final adapter weights. The compiled case checks
+gradients through the compiled function itself.
+
+| Version 5 configuration          | Short trial updates/second | Gradient result                            |
+| -------------------------------- | -------------------------: | ------------------------------------------ |
+| Existing MLX FP16, one GPU       |                      0.692 | Reference                                  |
+| MLX FP32, two GPUs               |                      0.435 | 0.0030% relative L2 against FP32 reference |
+| xFormers FP16, two GPUs          |                      1.110 | 48.7% relative L2 against FP16 reference   |
+| xFormers FP32, two GPUs          |                      0.644 | 0.0074% relative L2 against FP32 reference |
+| Compiled xFormers FP32, two GPUs |                      0.600 | 0.0076% relative L2 against FP32 reference |
+
+The retained configuration is the existing trainer. Its final 80-update
+verification across eight context lengths measured 0.752 updates/second, or 6.02
+examples/second, with finite losses and weights. The gate requires initial loss
+error below 1e-5 and gradient relative L2 below 1% against the corresponding
+precision reference. This conservative gate preserves the current calculation;
+it does not establish that faster FP16 alternatives have worse task accuracy.
+The numerical check covers the longest batch, while the throughput and finite
+checks cover all eight lengths. None of these measurements is a convergence or
+held-out accuracy comparison. The highest measured FP16 speed, 1.312
+updates/second in version 4, remains a candidate for a separate accuracy trial.
+No faster replacement was adopted, and the active 15,000-update job continued.
+
+The source of the PyTorch experiments is `training/torch_benchmark.py`; it is a
+diagnostic implementation, not the production trainer. Versions 2, 3, 4, and 5 are
+retained under `training/runs/kaggle/search-download/`, `attention-download/`,
+`precision-download/`, and `final-download/` respectively. The active production
+run kept its original configuration throughout.
+
+The hardware constraints matter: [MLX 0.32.3's fused CUDA attention kernel](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/cuda/scaled_dot_product_attention.cpp)
+requires Ampere or newer and head dimensions at most 128. T4 and FunctionGemma's
+256-dimensional attention heads fall outside those limits. The
+[xFormers CUTLASS implementation](https://github.com/facebookresearch/xformers/blob/v0.0.32.post2/xformers/ops/fmha/cutlass.py)
+supports older GPUs and head dimension 256. Local attention support differs
+between its forward and backward kernels: training rejects the bottom-right local
+mask, while the block-diagonal causal local mask is listed as supported. The
+experimental runner checks the materialized mask, including separation between
+examples, before measuring that representation.
+
+#### Accuracy trial for the faster trainer
+
+Notebook version 6 resumed the same retained update-5,000 adapter and optimizer
+for two arms: the existing single-GPU trainer and the 1.312-updates/second
+two-GPU MLX candidate. Each trained 500 additional updates with the same 15,000-step
+learning-rate schedule and the same 4,000 training-example positions. The job
+confirmed matching hashes of the starting weights, optimizer, dataset, task, and
+exact batch order before comparing the arms. A local check
+verified its sampling against the native resumed iterator across epoch boundaries.
+
+After training, each arm evaluated all 470 validation commands and all eight
+validation sessions (300 turns) on its own GPU. Both arms finished with finite
+losses and adapter weights. The first 50 updates were excluded from the sustained
+speed measurement. The baseline compiled kernels from a cold cache; the second
+arm reused that cache, so total elapsed times are not a fair comparison of
+compilation costs.
+
+| Measure                                                   | One GPU          | Two GPUs         |
+| --------------------------------------------------------- | ---------------- | ---------------- |
+| Sustained updates/second                                  | 0.786            | 1.449            |
+| Exact validation commands                                 | 411/470 (87.45%) | 416/470 (88.51%) |
+| Supported validation actions                              | 217/219          | 218/219          |
+| Exact session actions                                     | 241/300 (80.33%) | 249/300 (83.00%) |
+| Matching canvas state                                     | 54/300 (18.00%)  | 60/300 (20.00%)  |
+| Perfect sessions                                          | 2/8              | 2/8              |
+| Matching final canvas state                               | 3/8              | 3/8              |
+| Unwanted mutations on 140 unsupported or missing requests | 27               | 29               |
+
+The faster arm gained 84.3% sustained throughput, 1.06 percentage points on
+commands, and 2.67 points on session actions. It corrected ten command cases but
+regressed five; session actions had 18 improvements and ten regressions.
+It failed the conservative observed-accuracy gate because rename accuracy fell
+from 41/41 to 40/41 and unwanted mutations increased. The two-GPU configuration
+remains an experimental candidate; the completed main model is retained.
+
+This is one paired trial from update 5,000 to 5,500, so it does not establish
+accuracy throughout a longer training run. The final test split was evaluated
+only for the completed main model. The launch record and live log are
+`training/runs/kaggle/quality-run.json` and `quality-live.log`. Downloaded adapters,
+evaluation reports, and raw telemetry are under
+`training/runs/kaggle/quality-download/`; `quality-comparison.json` was recomputed
+locally and verified against those reports.
+
+The GPU sampler recorded one reading per second. Excluding the first 50 updates,
+the baseline supplied 562 samples per device over 575.6 seconds; the faster arm
+supplied 305 per device over 312.2 seconds. Each T4 had 15,360 MiB of VRAM and a
+70 W power limit.
+
+| Setup and device   | Mean GPU busy time | Peak VRAM used | Mean power |
+| ------------------ | ------------------ | -------------- | ---------- |
+| One GPU, device 0  | 97.45%             | 6,549 MiB      | 65.87 W    |
+| One GPU, device 1  | 0.00%              | 0 MiB          | 9.71 W     |
+| Two GPUs, device 0 | 95.13%             | 5,057 MiB      | 64.11 W    |
+| Two GPUs, device 1 | 95.19%             | 5,149 MiB      | 64.75 W    |
+
+[NVIDIA defines GPU utilization](https://docs.nvidia.com/deploy/nvidia-smi/index.html#utilization)
+as the fraction of sampled time with a kernel executing. It does not measure
+the fraction of peak FLOPs achieved. Similarly, its memory utilization measures
+time spent reading or writing device memory, separately from VRAM allocation.
+Peak compute throughput and kernel occupancy were not profiled. The sustained
+utilization summary is saved as `quality-download/quality-gpu.json`. The same
+parser reproduced the previous retained baseline readings exactly and now adds
+GPU summaries to future accuracy trials.
+
+### First local experiment
+
+The original dataset had 195 examples (132 training, 28 validation, 35 test).
+Its snapshot is preserved in `runs/first-lora/examples.jsonl`. The first 200-step
+run on an M4 Mac with 16 GB RAM took 436 seconds and used a peak
+of 1.97 GB of MLX memory. It trained 1.898 million adapter parameters (0.708% of the
+base model); the final adapter is 7.62 MB. These are measurements of this run.
+
+| Evaluation                  | Original model | LoRA adapter |
+| --------------------------- | -------------- | ------------ |
+| Exact validation actions    | 0/28           | 5/28         |
+| Exact held-out test actions | 0/35           | 7/35         |
+| Valid test calls            | 16/35          | 28/35        |
+
+Validation loss fell from 2.143 to 0.108, but exact test accuracy was only 20%.
+The adapter still drops requested fields and methods, chooses incorrect tools, and
+handles ambiguous targets poorly. It is an initial training exercise, not a model
+ready to execute canvas edits. Inspect the raw errors in `runs/first-lora/valid.json`
+and `runs/first-lora/test.json` before building another dataset version. The next
+experiment should diversify wording, field names, entity names, and context examples;
+choose changes using validation data and reserve a fresh test set once these test
+failures influence training. The saved adapter and logs are under `runs/first-lora/`.
+
+### Second local experiment
+
+The previous dataset had 861 examples (672 training, 81 validation, 108 test)
+and was used for `runs/data-v2-diverse/`. This run used
+600 updates, batch size 2, and no gradient checkpointing, with the same base model,
+learning rate, and LoRA rank. It took 19.1 minutes and peaked at 5.17 GB of MLX
+memory. Validation loss fell from 2.150 to 0.067. The data and training settings
+both changed, so this comparison measures the complete experiment; it does not
+isolate the effect of additional examples.
+
+Both adapters were evaluated on the same new validation and test sets. Target
+entity names and command phrasing in these sets were excluded from training.
+The 600-step adapter was fixed before evaluating the new test set.
+
+| Evaluation                     | First adapter | Second adapter |
+| ------------------------------ | ------------- | -------------- |
+| Exact validation actions       | 3/81 (3.7%)   | 50/81 (61.7%)  |
+| Exact test actions             | 5/108 (4.6%)  | 46/108 (42.6%) |
+| Valid test calls               | 74/108        | 99/108         |
+| Correct test tool selection    | 38/108        | 73/108         |
+| Median test prediction latency | 0.518 s       | 0.497 s        |
+
+Exact test actions by tool were 5/24 for schema creation, 5/12 for adding a
+property, 7/8 for removing a property, 0/8 for renaming, 1/8 for connecting schemas,
+and 28/48 for `no_action`. Remaining errors include modified schema names, wrong
+selected IDs, and ambiguous edits proceeding instead of returning `no_action`.
+
+### Third Colab experiment
+
+`runs/colab-270m-v3-stable/` contains the completed FunctionGemma 270M experiment
+with 12,350 training examples. It ran 3,000 updates on a Tesla T4 with 15,360 MiB
+of GPU memory. Training took 37.2 minutes and peaked at 5.80 GB of MLX allocations.
+The FP16 base checkpoint stayed frozen; rank-32 LoRA trained 7.594 million parameters.
+The saved configuration uses scale 8 and a 100-update learning-rate warmup followed
+by cosine decay. Training ran directly inside the notebook kernel through the Colab
+CLI. The adapter was downloaded, verified by SHA-256, and the GPU session released.
+
+The new validation and test splits exclude their target entity names and phrasing
+from training. Both checkpoints below were evaluated on the same 144 validation
+examples on the M4 Mac. The final checkpoint was selected before running the test
+evaluation. Earlier experiment results use different, retired splits.
+
+| Checkpoint    | Exact validation actions |
+| ------------- | ------------------------ |
+| 500 updates   | 125/144 (86.8%)          |
+| 3,000 updates | 132/144 (91.7%)          |
+
+The selected checkpoint got **199/222 exact test actions (89.6%)**, produced
+219/222 valid calls (98.6%), and selected the correct tool in 209/222 cases (94.1%).
+Median prediction time on the Mac was 0.474 seconds, with a maximum of 1.175 GB of
+MLX allocations. These latency numbers cover text-to-action inference.
+
+| Tool              | Exact test actions |
+| ----------------- | ------------------ |
+| Create schema box | 32/42              |
+| Add property      | 24/24              |
+| Remove property   | 12/12              |
+| Rename schema     | 24/24              |
+| Connect schemas   | 12/12              |
+| No action         | 95/108             |
+
+The original `User` command also passes with all three fields and five methods.
+It is a seen training example and serves as a local loading and action check.
+Remaining errors include list copying and unsupported requests becoming edits;
+the parser rejected three invalid test calls. These are controlled, templated
+command results. The local voice mode now supplies speech transcription and canvas execution.
+
+The run includes the adapter, frozen source, configuration, dataset, task definition,
+hardware, training log, Colab validation (`valid.json`), Mac validation
+(`valid-mac.json`), and test report (`test.json`). The downloaded compact bundle is
+`runs/colab-270m-v3-stable-final.zip`; intermediate checkpoint backups are also local.
+The adapter's SHA-256 is
+`b888c9ea52cca9d12041da830d54ec60323d4d1bdd162f9f51825e53543a1856`.
+
+Use the selected adapter:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/lab.py predict \
+  'Create a User schema with properties name, class, subjects and methods getName, getClass, getSubjects, addSubject, removeSubject.' \
+  --adapter templates/agent/training/runs/colab-270m-v3-stable/adapter
+```
+
+The second adapter passes the original User schema command with all three fields
+and five methods, but that exact example is in its training set. This demonstrates
+learning a seen example, not generalization to an unseen request.
+
+The model still needs work before automatic canvas execution. Reports and raw
+predictions are saved in `runs/data-v2-diverse/valid.json` and `test.json`;
+`comparison.json` records both adapters' scores on the same inputs. The seen User
+example is recorded separately in `seen-user-diagnostic.json`. Keep this test set
+as a record of this experiment; reserve another fresh set if these failures guide
+the next training changes. The current local voice mode uses the version-four
+checkpoint; these older measurements remain historical experiment records.
 
 ## Agent overview
 
