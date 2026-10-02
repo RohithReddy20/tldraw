@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { expect, test } from '@playwright/test'
 import type { APIRequestContext, Page, TestInfo } from '@playwright/test'
-import type { Editor } from 'tldraw'
+import type { Editor, TLShapeId } from 'tldraw'
 import type {
 	CanvasAction,
 	canvasContext,
@@ -16,6 +16,17 @@ test.beforeEach(async ({ page }) => {
 	await page.goto('/e2e/fixture.html')
 	await page.waitForFunction(() => !!window.editor)
 })
+
+async function drag(page: Page, id: TLShapeId, dx: number, dy: number) {
+	const point = await page.evaluate(
+		(id) => editor.pageToScreen(editor.getShapePageBounds(id)!.center),
+		id
+	)
+	await page.mouse.move(point.x, point.y)
+	await page.mouse.down()
+	await page.mouse.move(point.x + dx, point.y + dy, { steps: 8 })
+	await page.mouse.up()
+}
 
 test('creates, selects, moves, styles, groups, deletes and restores native shapes', async ({
 	page,
@@ -201,6 +212,39 @@ test('arranges shapes and rejects stale or partially missing targets atomically'
 	await expect(page.locator('.tl-canvas').first()).toBeVisible()
 })
 
+test('captures a manual drag before the next voice edit', async ({ page }) => {
+	const created = await page.evaluate(() => {
+		const outcome = voice.execute(
+			editor,
+			{ name: 'create_shape', arguments: { kind: 'rectangle', text: 'Customer', x: 100, y: 100 } },
+			voice.context(editor)
+		)
+		return { id: outcome.createdId!, snapshot: voice.context(editor) }
+	})
+	await drag(page, created.id, 35, 25)
+	const moved = await page.evaluate(() => voice.context(editor))
+	const result = await page.evaluate(
+		({ created, moved }) => {
+			const action = {
+				name: 'move_shapes',
+				arguments: { shape_ids: [created.id], dx: -10, dy: -15 },
+			}
+			let rejected = false
+			try {
+				voice.execute(editor, action, created.snapshot)
+			} catch {
+				rejected = true
+			}
+			voice.execute(editor, action, moved)
+			return { rejected, current: voice.context(editor).shapes[0] }
+		},
+		{ created, moved }
+	)
+	expect(moved.shapes[0]).toMatchObject({ x: 135, y: 125 })
+	expect(result.rejected).toBe(true)
+	expect(result.current).toMatchObject({ x: 125, y: 110 })
+})
+
 test.describe('model integration', () => {
 	test.skip(!process.env.VOICE_MODEL_URL, 'Requires a running local action model.')
 	test.setTimeout(180_000)
@@ -266,12 +310,13 @@ test.describe('model integration', () => {
 		expect(moved.canvas.shapes[0]).toMatchObject({ x: 180, y: 100 })
 		const styled = await send({ command: 'Make it blue.' }, 'style_shapes')
 		expect(styled.canvas.shapes[0].color).toBe('blue')
+		await drag(page, create.outcome.createdId!, 35, 25)
 		const copy = await send({ command: 'Duplicate it.' }, 'arrange_shapes')
 		expect(copy.canvas.shapes).toHaveLength(2)
 		const selected = await send({ command: 'Select all.' }, 'canvas_command')
 		expect(selected.canvas.selected_ids).toHaveLength(2)
 		const down = await send({ command: 'Move the selected shapes down by 40.' }, 'move_shapes')
-		expect(down.canvas.shapes.map((s) => s.y).sort((a, b) => a - b)).toEqual([140, 164])
+		expect(down.canvas.shapes.map((s) => s.y).sort((a, b) => a - b)).toEqual([165, 189])
 		const group = await send({ command: 'Group the selected shapes.' }, 'arrange_shapes')
 		expect(group.canvas.shapes.filter((s) => s.kind === 'group')).toHaveLength(1)
 		const ungroup = await send({ command: 'Ungroup it.' }, 'arrange_shapes')

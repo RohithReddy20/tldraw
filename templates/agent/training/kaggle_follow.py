@@ -261,7 +261,16 @@ def verify_native(directory):
                 status="passed" if result.returncode == 0 else "failed",
                 returncode=result.returncode,
             )
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            if result.returncode == 0:
+                browser = json.loads((output / "browser.json").read_text())
+                report["tests"] = browser["stats"]
+                expected = 2 if report["speech_fixture_used"] else 1
+                if (
+                    browser["stats"]["unexpected"]
+                    or browser["stats"]["expected"] < expected
+                ):
+                    raise RuntimeError("The native model checks did not all pass.")
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             report.update(status="failed", error=str(error))
         finally:
             if process is not None and process.poll() is None:

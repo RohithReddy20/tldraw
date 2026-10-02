@@ -75,10 +75,10 @@ budget is 6,144 tokens, including a 256-token response allowance. Selection cont
 can include the full canvas; an individual edit can target up to 30 shapes.
 
 The retained 15,000-update adapter was trained on the earlier six-tool contract.
-Its reported accuracy does not establish accuracy on the expanded tools. Three
+Its reported accuracy does not establish accuracy on the expanded tools. Four
 Playwright tests verify the native editor workflows, including nested group movement,
-bound-arrow cleanup, redo preservation, and atomic rejection of stale or missing
-targets. Run them with `pnpm --filter tldraw-agent test:voice`.
+manual pointer dragging, bound-arrow cleanup, redo preservation, and atomic rejection
+of stale or missing targets. Run them with `pnpm --filter tldraw-agent test:voice`.
 The optional model integration tests send commands through a running voice service
 and apply its responses in the native editor. Set `VOICE_MODEL_URL` to the service
 URL and `VOICE_SMOKE_AUDIO` to the synthetic speech fixture to enable both tests.
