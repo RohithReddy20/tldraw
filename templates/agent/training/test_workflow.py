@@ -1,5 +1,6 @@
 import copy
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -193,6 +194,32 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(
                     parse_call(tokenizer.decode(full[len(prompt) :]), canvas), action
                 )
+
+    def test_remote_observer_survives_an_outage_and_retries_result_download(self):
+        from kaggle_follow import main
+
+        failure = subprocess.CalledProcessError(1, ["kaggle", "kernels", "status"])
+        complete = 'owner/kernel has status "KernelWorkerStatus.COMPLETE"\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch(
+                    "sys.argv",
+                    ["follow", "--kernel", "owner/kernel", "--workflow", str(root)],
+                ),
+                patch("kaggle_follow.time.sleep") as sleep,
+                patch(
+                    "kaggle_follow.cli",
+                    side_effect=[*[failure] * 4, complete, "logs", complete, "logs"],
+                ),
+                patch(
+                    "kaggle_follow.finish_workflow", side_effect=[failure, None]
+                ) as finish,
+            ):
+                main()
+            self.assertEqual((root / "kernel.log").read_text(), "logs")
+            self.assertEqual(sleep.call_count, 5)
+            self.assertEqual(finish.call_count, 2)
 
     def test_remote_results_reject_a_different_final_adapter(self):
         import numpy as np

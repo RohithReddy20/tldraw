@@ -97,7 +97,8 @@ tokens and the longest response uses 92. Expanded-model accuracy remains pending
 Run metadata and live output are `training/runs/kaggle/workflow/run.json` and
 `live.log`. The observer downloads results and verifies final checkpoint weights
 and dataset/task hashes; it compares raw and guarded validation separately and
-preserves the fresh test set. Reattach the observer with:
+preserves the fresh test set. Connection failures are retried within the monitor's
+13-hour runtime without restarting training. Reattach the observer with:
 
 ```sh
 uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \

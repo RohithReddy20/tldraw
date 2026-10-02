@@ -202,9 +202,11 @@ def main():
             failures = 0
         except subprocess.SubprocessError as error:
             failures += 1
-            print(f"Kaggle status check failed ({failures}/3): {error}", flush=True)
-            if failures >= 3:
-                raise
+            print(
+                f"Kaggle status check failed ({failures}): {error}; "
+                "retrying within the supervised runtime.",
+                flush=True,
+            )
             time.sleep(60)
             continue
         match = re.search(r'has status "([^"]+)"', status)
@@ -212,16 +214,21 @@ def main():
             raise ValueError("Unrecognized Kaggle runtime status.")
         state = match[1].split(".")[-1].lower()
         if state in ("complete", "error", "cancel_acknowledged", "cancelled"):
-            log = cli("kernels", "logs", args.kernel)
-            (output / "kernel.log").write_text(log)
-            if state != "complete":
-                raise RuntimeError(
-                    f"Kaggle training failed; see {output / 'kernel.log'}"
-                )
-            if args.workflow:
-                finish_workflow(args.kernel, args.workflow)
-            else:
-                finish(args.kernel)
+            try:
+                log = cli("kernels", "logs", args.kernel)
+                (output / "kernel.log").write_text(log)
+                if state != "complete":
+                    raise RuntimeError(
+                        f"Kaggle training failed; see {output / 'kernel.log'}"
+                    )
+                if args.workflow:
+                    finish_workflow(args.kernel, args.workflow)
+                else:
+                    finish(args.kernel)
+            except subprocess.SubprocessError as error:
+                print(f"Result download interrupted: {error}; retrying.", flush=True)
+                time.sleep(60)
+                continue
             return
         time.sleep(60)
     raise TimeoutError("Kaggle training exceeded its supervised runtime.")
