@@ -839,10 +839,16 @@ def refinement_experiment(root, working, *, training_only=False):
     )
 
 
-def resume_refinement_evaluation(root, working, expected, *, source=None):
+def resume_refinement_evaluation(
+    root, working, expected, *, source=None, selected=False
+):
     from kaggle_follow import verify_workflow_checkpoint
     from lab import _metadata
 
+    if selected and expected.get("native_verification") != "passed":
+        raise ValueError(
+            "Final scoring requires passed native checks for this adapter."
+        )
     if source is None:
         sources = list(Path("/kaggle/input").rglob("refinement-training.json"))
         if len(sources) != 1:
@@ -901,7 +907,35 @@ def resume_refinement_evaluation(root, working, expected, *, source=None):
         f"Recovered update {trained['end_step']}; evaluating without training.",
         flush=True,
     )
-    evaluate_pair(root, output)
+    evaluate_pair(root, output, selected=selected)
+    if selected:
+        reports = {}
+        candidate = output / "dual-window"
+        for name in (
+            "valid",
+            "sessions-valid",
+            "valid-guarded",
+            "sessions-valid-guarded",
+            "test-guarded",
+            "sessions-test-guarded",
+        ):
+            report = json.loads((candidate / f"{name}.json").read_text())
+            if report["adapter_sha256"] != expected["adapter_sha256"]:
+                raise ValueError("Final reports score a different adapter.")
+            reports[name] = {
+                key: value for key, value in report.items() if key != "examples"
+            }
+        (working / "refinement-selected-evaluation.json").write_text(
+            json.dumps(
+                {
+                    "adapter_sha256": expected["adapter_sha256"],
+                    "test_set_used": True,
+                    "reports": reports,
+                },
+                indent=2,
+            )
+        )
+        return
     result = {
         mode: quality_comparison(
             output / "baseline", output / "dual-window", guarded=mode == "guarded"
@@ -962,15 +996,25 @@ def quality_experiment(root, working):
     )
 
 
-def evaluate_pair(root, output):
+def evaluate_pair(root, output, *, selected=False):
     evaluations = []
     handles = []
+    log_paths = {}
+    cases = ("valid", "test") if selected else ("baseline", "dual-window")
     try:
-        for device, case in enumerate(("baseline", "dual-window")):
+        # Concurrent conversion can expose an unfinished checkpoint to the other worker.
+        from lab import model_path
+
+        model_path("float16")
+        for device, case in enumerate(cases):
             environment = {**os.environ, "CUDA_VISIBLE_DEVICES": str(device)}
             environment.pop("MLX_RANK", None)
             environment.pop("MLX_WORLD_SIZE", None)
-            log = (output / case / "evaluation.log").open("w")
+            folder = output / "dual-window" if selected else output / case
+            log_paths[case] = folder / (
+                f"evaluation-{case}.log" if selected else "evaluation.log"
+            )
+            log = log_paths[case].open("w")
             handles.append(log)
             evaluations.append(
                 subprocess.Popen(
@@ -981,10 +1025,14 @@ def evaluate_pair(root, output):
                         "--root",
                         str(root),
                         "--output",
-                        str(output / case),
+                        str(folder),
                         "--case",
-                        case,
-                        "--evaluate-quality",
+                        "dual-window" if selected else case,
+                        *(
+                            ["--score-split", case]
+                            if selected
+                            else ["--evaluate-quality"]
+                        ),
                     ],
                     env=environment,
                     stdout=log,
@@ -992,7 +1040,7 @@ def evaluate_pair(root, output):
                     start_new_session=True,
                 )
             )
-        deadline = time.monotonic() + 7200
+        deadline = time.monotonic() + (10800 if selected else 7200)
         next_report = time.monotonic() + 30
         while any(process.poll() is None for process in evaluations):
             if any(process.poll() not in (None, 0) for process in evaluations):
@@ -1002,8 +1050,8 @@ def evaluate_pair(root, output):
             if time.monotonic() >= deadline:
                 raise TimeoutError("GPU accuracy evaluation exceeded its fixed limit.")
             if time.monotonic() >= next_report:
-                for case in ("baseline", "dual-window"):
-                    lines = (output / case / "evaluation.log").read_text().splitlines()
+                for case in cases:
+                    lines = log_paths[case].read_text().splitlines()
                     if lines:
                         print(f"QUALITY EVALUATING {case}: {lines[-1]}", flush=True)
                 next_report = time.monotonic() + 30
@@ -1064,6 +1112,55 @@ def evaluate_quality(output):
             report = json.loads(report_path.read_text())
             report["adapter_sha256"] = adapter_sha256
             report_path.write_text(json.dumps(report, indent=2))
+            mx.clear_cache()
+
+
+def score_selected_split(output, split):
+    import mlx.core as mx
+
+    from lab import evaluate, evaluate_sessions
+
+    if mx.default_device() != mx.gpu:
+        raise RuntimeError("Final scoring requires the CUDA GPU.")
+    digest = hashlib.sha256(
+        (output / "adapter/adapters.safetensors").read_bytes()
+    ).hexdigest()
+    for guarded in (False, True) if split == "valid" else (True,):
+        for function, prefix in ((evaluate, ""), (evaluate_sessions, "sessions-")):
+            suffix = "-guarded" if guarded else ""
+            path = output / f"{prefix}{split}{suffix}.json"
+            function(
+                argparse.Namespace(
+                    split=split,
+                    adapter=output / "adapter",
+                    output=path,
+                    limit=None,
+                    guarded=guarded,
+                )
+            )
+            report = json.loads(path.read_text())
+            report["adapter_sha256"] = digest
+            path.write_text(json.dumps(report, indent=2))
+            print(
+                "FINAL SCORE "
+                + json.dumps(
+                    {
+                        "report": path.name,
+                        **{
+                            key: report[key]
+                            for key in (
+                                "total",
+                                "turns",
+                                "correct",
+                                "exact_action_accuracy",
+                                "state_agreement_rate",
+                            )
+                            if key in report
+                        },
+                    }
+                ),
+                flush=True,
+            )
             mx.clear_cache()
 
 
@@ -1131,8 +1228,11 @@ if __name__ == "__main__":
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--evaluate-quality", action="store_true")
+    parser.add_argument("--score-split", choices=("valid", "test"))
     args = parser.parse_args()
-    if args.evaluate_quality:
+    if args.score_split:
+        score_selected_split(args.output, args.score_split)
+    elif args.evaluate_quality:
         evaluate_quality(args.output)
     else:
         worker(args.root, args.output, args.case, args.verify, args.quality)

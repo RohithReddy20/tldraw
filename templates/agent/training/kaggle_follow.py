@@ -137,7 +137,7 @@ def finish_workflow(kernel, directory, *, training_only=False):
         verification="checkpoint weights, task, dataset and warm-start hashes match",
         adapter_sha256=hashlib.sha256(weights.read_bytes()).hexdigest(),
         training=result,
-        test_set_used=False,
+        test_set_used=launch.get("test_set_used", False),
     )
     (directory / "run.json").write_text(json.dumps(launch, indent=2))
     if training_only:
@@ -195,6 +195,244 @@ def verify_workflow_checkpoint(download, launch):
     ):
         raise ValueError("Workflow weights differ from the completed checkpoint.")
     return result, weights
+
+
+def finish_selected_workflow(kernel, directory):
+    finish_workflow(kernel, directory, training_only=True)
+    launch = json.loads((directory / "run.json").read_text())
+    result = json.loads(
+        (directory / "download/refinement-selected-evaluation.json").read_text()
+    )
+    if (
+        result["adapter_sha256"] != launch["adapter_sha256"]
+        or not result["test_set_used"]
+    ):
+        raise ValueError("Final scores do not match the verified adapter.")
+    totals = {
+        "valid": 1200,
+        "valid-guarded": 1200,
+        "sessions-valid": 480,
+        "sessions-valid-guarded": 480,
+        "test-guarded": 2880,
+        "sessions-test-guarded": 1440,
+    }
+    for name, total in totals.items():
+        report = result["reports"][name]
+        count = report["turns"] if name.startswith("sessions-") else report["total"]
+        if count != total or any(
+            report[key] != launch[key]
+            for key in ("adapter_sha256", "dataset_sha256", "task_sha256")
+        ):
+            raise ValueError(f"Final report differs in {name}.")
+    launch.update(
+        status="evaluated", test_set_used=True, final_scores=result["reports"]
+    )
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    print("Final validation and fresh holdout scores are saved.", flush=True)
+
+
+def launch_final_scoring(directory):
+    directory = directory.resolve()
+    launch = json.loads((directory / "run.json").read_text())
+    native = launch.get("native_verification", {})
+    if native.get("status") != "passed" or native.get("adapter_sha256") != launch.get(
+        "adapter_sha256"
+    ):
+        raise ValueError(
+            "Final scoring requires passed native checks for this adapter."
+        )
+    if launch.get("test_set_used") or launch.get("test_set_started"):
+        raise ValueError("The final holdout has already been used for this adapter.")
+    verify_workflow_checkpoint(directory / "download", launch)
+    output = directory / "final-score"
+    inputs = output / "input"
+    inputs.mkdir(parents=True, exist_ok=True)
+    bundle = inputs / "canvas-checkpoint.bundle"
+    source = directory / "download"
+    with zipfile.ZipFile(
+        bundle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+    ) as archive:
+        archive.write(source / "refinement-training.json", "refinement-training.json")
+        for case in ("baseline", "dual-window"):
+            for filename in (
+                "config.yaml",
+                "adapter/adapters.safetensors",
+                "adapter/adapter_config.json",
+            ):
+                path = source / "refinement" / case / filename
+                archive.write(path, path.relative_to(source))
+        for filename in ("adapters.safetensors", "progress.json"):
+            path = (
+                source
+                / "refinement/dual-window/adapter/checkpoints"
+                / f"{launch['updates']:07d}"
+                / filename
+            )
+            archive.write(path, path.relative_to(source))
+    digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    dataset = "rohithresearch/canvas-270m-v6-final-checkpoint"
+    kernel_id = "rohithresearch/canvas-270m-v6-final-score"
+    (inputs / "dataset-metadata.json").write_text(
+        json.dumps(
+            {
+                "title": "Canvas 270m v6 final checkpoint",
+                "id": dataset,
+                "licenses": [{"name": "CC0-1.0"}],
+            },
+            indent=2,
+        )
+    )
+    cli(
+        "datasets",
+        "create",
+        "--path",
+        str(inputs),
+        "--quiet",
+        "--keep-tabular",
+        timeout=1200,
+    )
+    deadline = time.monotonic() + 600
+    while "ready" not in cli("datasets", "status", dataset).lower():
+        if time.monotonic() > deadline:
+            raise TimeoutError("Final checkpoint upload did not become ready.")
+        time.sleep(30)
+    kernel = output / "kernel"
+    kernel.mkdir(exist_ok=True)
+    metadata = json.loads((directory / "kernel/kernel-metadata.json").read_text())
+    metadata.update(
+        id=kernel_id,
+        title="Canvas 270m v6 final score",
+        dataset_sources=[launch["dataset"], dataset],
+    )
+    (kernel / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2))
+    expected = {
+        key: launch[key]
+        for key in (
+            "updates",
+            "dataset_sha256",
+            "task_sha256",
+            "warm_start_sha256",
+            "adapter_sha256",
+        )
+    }
+    expected["native_verification"] = "passed"
+    sources = {path.name: path.read_text() for path in ROOT.glob("*.py")}
+    for name in ("actions.py", "dataset.py", "lab.py", "sessions.py"):
+        sources[name] = (Path(launch["frozen_data"]) / name).read_text()
+    code = (
+        "TASK = 'score'\nEVALUATION_EXPECTED = "
+        + repr(expected)
+        + "\nEVALUATION_CHECKPOINT_SHA256 = "
+        + repr(digest)
+        + "\nTRAINING_SOURCES = "
+        + repr(sources)
+        + "\n"
+        + (ROOT / "kaggle_job.py").read_text()
+    )
+    compile(code, "kaggle_job.py", "exec")
+    (kernel / "kaggle_job.py").write_text(code)
+    final = {
+        **launch,
+        "kernel": kernel_id,
+        "status": "submitting",
+        "test_set_started": True,
+        "source_training_kernel": launch["kernel"],
+        "checkpoint_bundle_sha256": digest,
+    }
+    (output / "run.json").write_text(json.dumps(final, indent=2))
+    # A timed-out push may still start scoring; preserve that exposure on retry.
+    launch.update(
+        test_set_started=True,
+        final_scoring={"status": "submitting", "kernel": kernel_id},
+    )
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    pushed = cli(
+        "kernels",
+        "push",
+        "--path",
+        str(kernel),
+        "--timeout",
+        "14400",
+        "--accelerator",
+        "NvidiaTeslaT4",
+        timeout=300,
+    )
+    if "successfully pushed" not in pushed or "not valid" in pushed:
+        raise RuntimeError("Kaggle did not accept the final scoring job.")
+    final["status"] = "running"
+    (output / "run.json").write_text(json.dumps(final, indent=2))
+    launch["final_scoring"]["status"] = "running"
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+    print(
+        "Selected-model validation and fresh holdout scoring launched on Kaggle.",
+        flush=True,
+    )
+    with (output / "follow.log").open("w") as log:
+        subprocess.run(
+            [
+                sys.executable,
+                "-u",
+                str(ROOT / "kaggle_follow.py"),
+                "--kernel",
+                kernel_id,
+                "--workflow",
+                str(output),
+                "--selected-score",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=5 * 60 * 60,
+        )
+    scored = json.loads((output / "run.json").read_text())
+    launch.update(
+        status="evaluated",
+        test_set_used=True,
+        final_scores=scored["final_scores"],
+        final_score_kernel=kernel_id,
+        final_scoring={"status": "complete", "kernel": kernel_id},
+    )
+    (directory / "run.json").write_text(json.dumps(launch, indent=2))
+
+
+def await_final_scoring(directory):
+    deadline = time.monotonic() + 5 * 60 * 60
+    print("Waiting for completed training and native integration checks.", flush=True)
+    while time.monotonic() < deadline:
+        try:
+            launch = json.loads((directory / "run.json").read_text())
+        except json.JSONDecodeError:
+            time.sleep(5)
+            continue
+        if launch.get("test_set_used") or launch.get("test_set_started"):
+            print("Final scoring was already scheduled; see final-score/.", flush=True)
+            return
+        native = launch.get("native_verification", {})
+        if native.get("status") == "failed":
+            launch["final_scoring"] = {"status": "needs_native_fix"}
+            (directory / "run.json").write_text(json.dumps(launch, indent=2))
+            print(
+                "Native checks failed; the final holdout remains untouched.", flush=True
+            )
+            return
+        if native.get("status") == "passed":
+            try:
+                launch_final_scoring(directory)
+            except (
+                OSError,
+                ValueError,
+                RuntimeError,
+                subprocess.SubprocessError,
+            ) as error:
+                launch = json.loads((directory / "run.json").read_text())
+                launch.setdefault("final_scoring", {}).update(
+                    status="failed", error=str(error)
+                )
+                (directory / "run.json").write_text(json.dumps(launch, indent=2))
+                raise
+            return
+        time.sleep(30)
+    raise TimeoutError("Training and native checks did not finish within five hours.")
 
 
 def verify_native(directory):
@@ -309,11 +547,25 @@ def main():
     parser.add_argument("--workflow", type=Path)
     parser.add_argument("--native-check", action="store_true")
     parser.add_argument("--training-only", action="store_true")
+    parser.add_argument("--selected-score", action="store_true")
+    parser.add_argument("--await-final-score", action="store_true")
     args = parser.parse_args()
     if args.native_check and not args.workflow:
         parser.error("--native-check requires --workflow.")
     if args.training_only and not args.workflow:
         parser.error("--training-only requires --workflow.")
+    if args.selected_score and (not args.workflow or args.training_only):
+        parser.error("--selected-score requires --workflow without --training-only.")
+    if args.await_final_score:
+        if not args.workflow or any(
+            (args.selected_score, args.native_check, args.training_only)
+        ):
+            parser.error("--await-final-score requires only --kernel and --workflow.")
+        launch = json.loads((args.workflow / "run.json").read_text())
+        if launch["kernel"] != args.kernel:
+            parser.error("--kernel differs from the workflow being monitored.")
+        await_final_scoring(args.workflow)
+        return
     output = args.workflow or OUTPUT
     output.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 13 * 60 * 60
@@ -348,7 +600,9 @@ def main():
                         f"recovered. See {output / 'kernel.log'}"
                     )
                 if args.workflow:
-                    if args.training_only:
+                    if args.selected_score:
+                        finish_selected_workflow(args.kernel, args.workflow)
+                    elif args.training_only:
                         finish_workflow(args.kernel, args.workflow, training_only=True)
                     else:
                         finish_workflow(args.kernel, args.workflow)

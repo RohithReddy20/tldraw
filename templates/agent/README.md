@@ -92,25 +92,56 @@ The reproducible builder is `training/build_workflow.py`; generated artifacts st
 under `training/runs/v5-general-canvas/`. Session state checks use a Python document
 simulation; they do not measure pixel layout or replace the native browser tests.
 The private Kaggle run
-`rohithresearch/canvas-270m-v5-general-workflow` is active on two Tesla T4 GPUs.
-It targets 6,000 updates, batch eight, micro batch two per GPU, completion window
+`rohithresearch/canvas-270m-v5-general-workflow` completed all 6,000 updates on two
+Tesla T4 GPUs, with batch eight, micro batch two per GPU, completion window
 160, and a 6,144-token limit. It starts from the retained 15,000-update adapter
 with a fresh optimizer. The checked-in profile is `training/workflow-config.yaml`.
 All generated calls passed round-trip checks; the longest example uses 4,330
-tokens and the longest response uses 92. All 6,000 training updates finished;
-GPU validation is running and expanded-model accuracy remains pending. Local checks
-pass: 42 Python lab tests and four native browser tests. The two model integration
-tests run after the completed adapter is downloaded and verified.
+tokens and the longest response uses 92. The downloaded weights exactly match the
+final checkpoint, with verified dataset, task, and warm-start hashes. Validation
+stopped when a simulated manual drag targeted a shape the baseline had failed to
+create. The evaluator now retains that state mismatch without crashing; validation
+has restarted on `rohithresearch/canvas-270m-v5-validation` using the saved weights.
+Expanded-model accuracy remains pending. Four native browser tests pass. With the
+6,000-update model, the synthetic speech integration test passes, while the editing
+test fails at "Make it blue." Separate development probes also exposed failures
+for moving down, ungrouping, and redo; these probes are not a held-out benchmark.
 Run metadata and live output are `training/runs/kaggle/workflow/run.json` and
 `live.log`. The observer downloads results and verifies final checkpoint weights
 and dataset/task hashes; it compares raw and guarded validation separately and
 preserves the fresh test set. Connection failures are retried within the monitor's
-13-hour runtime without restarting training. Reattach the observer with:
+13-hour runtime without restarting training.
+
+The next run, `rohithresearch/canvas-270m-v6-spoken-training`, is training for 2,000
+additional updates on two Tesla T4 GPUs. It starts from the verified 6,000-update
+weights with a fresh optimizer and the profile `training/spoken-config.yaml`.
+Its 117,600 training examples comprise 48,000 spoken command variations, 48,000
+replayed examples, and 21,600 turns in 800 editing sessions. These sessions repeatedly
+group, move, ungroup, manually drag, style, delete, undo, and redo. The builder retains
+the original validation and test examples and sessions unchanged. Training artifacts
+stay under `training/runs/v6-spoken-workflow/`; remote run metadata and logs are under
+`training/runs/kaggle/spoken/`.
+
+After this run, the observer verifies the final checkpoint and runs the native model
+integration tests. A separate continuation waits for these tests to pass before
+launching selected-model scoring on Kaggle: raw and guarded validation, plus guarded
+fresh tests covering 2,880 independent commands and 1,440 session turns. A failed
+native check leaves the fresh test set untouched. Final reports must match the same
+adapter, dataset, and task hashes and include every expected example. Reattach the
+training observer with:
 
 ```sh
 uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \
-  --kernel rohithresearch/canvas-270m-v5-general-workflow \
-  --workflow templates/agent/training/runs/kaggle/workflow --native-check
+  --kernel rohithresearch/canvas-270m-v6-spoken-training \
+  --workflow templates/agent/training/runs/kaggle/spoken --training-only --native-check
+```
+
+Start the final scoring continuation separately:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/kaggle_follow.py \
+  --kernel rohithresearch/canvas-270m-v6-spoken-training \
+  --workflow templates/agent/training/runs/kaggle/spoken --await-final-score
 ```
 
 `--native-check` starts a temporary local service after checkpoint verification,

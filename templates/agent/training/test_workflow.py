@@ -512,7 +512,9 @@ class WorkflowTests(unittest.TestCase):
             ):
                 resume_refinement_evaluation(root, output, expected)
                 train.assert_not_called()
-                evaluate.assert_called_once_with(root, output / "refinement")
+                evaluate.assert_called_once_with(
+                    root, output / "refinement", selected=False
+                )
             report = json.loads((output / "refinement/baseline/valid.json").read_text())
             self.assertEqual(report["adapter_sha256"], digest)
             self.assertEqual(
@@ -521,6 +523,98 @@ class WorkflowTests(unittest.TestCase):
                 ).read_bytes(),
                 weights.read_bytes(),
             )
+
+    def test_final_scoring_preserves_the_holdout_after_failed_native_checks(self):
+        from gpu_benchmark import resume_refinement_evaluation
+        from kaggle_follow import await_final_scoring, launch_final_scoring
+
+        with patch("kaggle_follow.verify_workflow_checkpoint") as verify:
+            with self.assertRaisesRegex(ValueError, "passed native checks"):
+                resume_refinement_evaluation(
+                    Path("unused"),
+                    Path("unused"),
+                    {"native_verification": "failed"},
+                    selected=True,
+                )
+            verify.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "run.json").write_text(
+                json.dumps(
+                    {
+                        "adapter_sha256": "model",
+                        "test_set_used": False,
+                        "native_verification": {
+                            "status": "failed",
+                            "adapter_sha256": "model",
+                        },
+                    }
+                )
+            )
+            with patch("kaggle_follow.cli") as cli:
+                with self.assertRaisesRegex(ValueError, "passed native checks"):
+                    launch_final_scoring(root)
+                with patch("kaggle_follow.launch_final_scoring") as score:
+                    await_final_scoring(root)
+                    score.assert_not_called()
+                cli.assert_not_called()
+            self.assertFalse((root / "final-score").exists())
+            launch = json.loads((root / "run.json").read_text())
+            self.assertEqual(launch["final_scoring"]["status"], "needs_native_fix")
+            launch["native_verification"].update(
+                status="passed", adapter_sha256="other"
+            )
+            (root / "run.json").write_text(json.dumps(launch))
+            with self.assertRaisesRegex(ValueError, "passed native checks"):
+                launch_final_scoring(root)
+            launch["native_verification"]["adapter_sha256"] = "model"
+            launch["test_set_started"] = True
+            (root / "run.json").write_text(json.dumps(launch))
+            with self.assertRaisesRegex(ValueError, "already been used"):
+                launch_final_scoring(root)
+
+    def test_final_reports_require_the_full_holdout_and_verified_adapter(self):
+        from kaggle_follow import finish_selected_workflow
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launch = {
+                "adapter_sha256": "model",
+                "dataset_sha256": "data",
+                "task_sha256": "task",
+                "test_set_started": True,
+            }
+            result = {
+                "adapter_sha256": "model",
+                "test_set_used": True,
+                "reports": {
+                    name: {**launch, count: total}
+                    for name, count, total in (
+                        ("valid", "total", 1200),
+                        ("valid-guarded", "total", 1200),
+                        ("sessions-valid", "turns", 480),
+                        ("sessions-valid-guarded", "turns", 480),
+                        ("test-guarded", "total", 2880),
+                        ("sessions-test-guarded", "turns", 1440),
+                    )
+                },
+            }
+            (root / "run.json").write_text(json.dumps(launch))
+            (root / "download").mkdir()
+            report = root / "download/refinement-selected-evaluation.json"
+            with patch("kaggle_follow.finish_workflow"):
+                for changes in ({"turns": 100}, {"adapter_sha256": "other"}):
+                    invalid = copy.deepcopy(result)
+                    invalid["reports"]["sessions-test-guarded"].update(changes)
+                    report.write_text(json.dumps(invalid))
+                    with self.assertRaisesRegex(ValueError, "sessions-test-guarded"):
+                        finish_selected_workflow("owner/kernel", root)
+                report.write_text(json.dumps(result))
+                finish_selected_workflow("owner/kernel", root)
+            saved = json.loads((root / "run.json").read_text())
+            self.assertEqual(saved["status"], "evaluated")
+            self.assertTrue(saved["test_set_used"])
+            self.assertTrue(saved["test_set_started"])
 
 
 if __name__ == "__main__":

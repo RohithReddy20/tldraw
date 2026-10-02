@@ -54,7 +54,15 @@ def main():
     parser.add_argument("--train", action="store_true")
     parser.add_argument(
         "--task",
-        choices=("train", "benchmark", "quality", "refine", "refine-train", "evaluate"),
+        choices=(
+            "train",
+            "benchmark",
+            "quality",
+            "refine",
+            "refine-train",
+            "evaluate",
+            "score",
+        ),
         default=globals().get("TASK", "train"),
     )
     args = parser.parse_args()
@@ -62,7 +70,8 @@ def main():
     # Production resumes on one T4; experiments can measure both allocated devices.
     os.environ["CUDA_VISIBLE_DEVICES"] = (
         "0,1"
-        if args.task in ("benchmark", "quality", "refine", "refine-train", "evaluate")
+        if args.task
+        in ("benchmark", "quality", "refine", "refine-train", "evaluate", "score")
         else "0"
     )
     working = Path("/kaggle/working")
@@ -91,7 +100,7 @@ def main():
             refinement_experiment(
                 root, working, training_only=args.task == "refine-train"
             )
-        elif args.task == "evaluate":
+        elif args.task in ("evaluate", "score"):
             from gpu_benchmark import resume_refinement_evaluation
 
             bundles = list(Path("/kaggle/input").rglob("canvas-checkpoint.bundle"))
@@ -103,7 +112,11 @@ def main():
                 bundles[0], source, globals()["EVALUATION_CHECKPOINT_SHA256"]
             )
             resume_refinement_evaluation(
-                root, working, globals()["EVALUATION_EXPECTED"], source=source
+                root,
+                working,
+                globals()["EVALUATION_EXPECTED"],
+                source=source,
+                selected=args.task == "score",
             )
         else:
             from colab_job import train_job
