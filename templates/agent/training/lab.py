@@ -617,20 +617,44 @@ def predict_batch(
         generator.close()
 
 
+def filter_examples(examples, requested_ids):
+    if requested_ids is None:
+        return examples
+    if (
+        not isinstance(requested_ids, (list, tuple))
+        or not requested_ids
+        or any(
+            not isinstance(identifier, str) or not identifier
+            for identifier in requested_ids
+        )
+    ):
+        raise ValueError("Requested evaluation IDs must be a nonempty list.")
+    identifiers = set(requested_ids)
+    if len(identifiers) != len(requested_ids):
+        raise ValueError("Requested evaluation IDs must be unique.")
+    missing = identifiers - {example["id"] for example in examples}
+    if missing:
+        raise ValueError(f"Requested evaluation IDs are absent: {sorted(missing)}")
+    return [example for example in examples if example["id"] in identifiers]
+
+
 def evaluate(args):
     prepare_data(write_rows=False)
+    examples = filter_examples(
+        [e for e in read_examples() if e["split"] == args.split],
+        getattr(args, "example_ids", None),
+    )
+    if args.limit:
+        examples = examples[: args.limit]
+    batch_size = getattr(args, "batch_size", 1)
+    if batch_size < 1:
+        raise ValueError("Evaluation batch size must be positive.")
     model, tokenizer = load_model(args.adapter)
     prefix_cache = (
         PromptPrefixCache(model, tokenizer)
         if getattr(args, "cache_prefix", False)
         else None
     )
-    examples = [e for e in read_examples() if e["split"] == args.split]
-    if args.limit:
-        examples = examples[: args.limit]
-    batch_size = getattr(args, "batch_size", 1)
-    if batch_size < 1:
-        raise ValueError("Evaluation batch size must be positive.")
     rows = []
     start = time.perf_counter()
     for offset in range(0, len(examples), batch_size):
@@ -687,19 +711,25 @@ def evaluate(args):
 
 
 def evaluate_sessions(args):
-    from sessions import CanvasSession, summarize_sessions
+    from sessions import (
+        SIMULATOR_VERSION,
+        CanvasSession,
+        compare_session_state,
+        summarize_sessions,
+    )
 
+    cases = filter_examples(
+        [s for s in read_examples(ROOT / "sessions.jsonl") if s["split"] == args.split],
+        getattr(args, "session_ids", None),
+    )
+    if args.limit:
+        cases = cases[: args.limit]
     model, tokenizer = load_model(args.adapter)
     prefix_cache = (
         PromptPrefixCache(model, tokenizer)
         if getattr(args, "cache_prefix", False)
         else None
     )
-    cases = [
-        s for s in read_examples(ROOT / "sessions.jsonl") if s["split"] == args.split
-    ]
-    if args.limit:
-        cases = cases[: args.limit]
     rows = []
     for case in cases:
         actual, oracle = (
@@ -726,6 +756,7 @@ def evaluate_sessions(args):
                 result.update(prediction=None, error=str(error))
                 actual.execute(step["command"], None, created_id)
             oracle.execute(step["command"], step["expected"], created_id)
+            actual_state, oracle_state = actual.snapshot(), oracle.snapshot()
             result.update(
                 id=step["id"],
                 session_id=case["id"],
@@ -733,8 +764,8 @@ def evaluate_sessions(args):
                 command=step["command"],
                 expected=step["expected"],
                 correct=result["prediction"] == step["expected"],
-                mutated=before != actual.snapshot(),
-                state_matches=actual.snapshot() == oracle.snapshot(),
+                mutated=before != actual_state,
+                **compare_session_state(actual_state, oracle_state),
             )
             rows.append(result)
         correct = sum(r["correct"] for r in rows[-len(case["turns"]) :])
@@ -745,6 +776,7 @@ def evaluate_sessions(args):
         "split": args.split,
         "adapter": str(args.adapter),
         "mode": "closed_loop_predicted_state",
+        "simulator_version": SIMULATOR_VERSION,
         "execution_guards": getattr(args, "guarded", False),
         "cached_prompt_tokens": len(prefix_cache.tokens) if prefix_cache else 0,
         "examples": rows,

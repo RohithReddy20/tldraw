@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import random
 import re
 import subprocess
 import tempfile
@@ -17,9 +18,391 @@ from actions import (
     parse_call,
     validate_call,
 )
-from build_workflow import build_spoken_refinement, build_workflow, call
+from build_workflow import (
+    accuracy_example,
+    accuracy_fingerprint,
+    accuracy_quotas,
+    build_accuracy_refinement,
+    build_spoken_refinement,
+    build_workflow,
+    call,
+)
 from dataset import audit_examples, training_row
 from sessions import CanvasSession
+
+
+class AccuracyDataTests(unittest.TestCase):
+    def test_reference_on_empty_canvas_is_missing_instead_of_ambiguous(self):
+        row = accuracy_example(
+            CanvasSession({}),
+            random.Random(1),
+            "train",
+            "empty:0",
+            "no_action:ambiguous_target",
+        )
+        self.assertEqual(row["expected"], call("no_action", reason="missing_target"))
+
+    def test_balanced_unique_data_and_reserved_test_preserve_historical_splits(self):
+        validation = {
+            "id": "historical-valid",
+            "group": "historical-valid",
+            "split": "valid",
+            "command": "Explain this previous validation diagram.",
+            "canvas": {},
+            "expected": call("no_action", reason="unsupported_request"),
+        }
+        old_test = {
+            **validation,
+            "id": "old-test",
+            "group": "old-test",
+            "split": "test",
+        }
+        obsolete = {
+            **validation,
+            "id": "obsolete-train",
+            "group": "obsolete-train",
+            "split": "train",
+            "command": "Paint the selected box green.",
+        }
+        historical_case = {
+            "id": "historical-session",
+            "split": "valid",
+            "initial_canvas": {},
+            "turns": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "examples.jsonl"
+            raw_test = json.dumps(old_test, separators=(", ", " : ")) + "\n"
+            source.write_text(
+                json.dumps(obsolete) + "\n" + json.dumps(validation) + "\n" + raw_test
+            )
+            (root / "sessions.jsonl").write_text(json.dumps(historical_case) + "\n")
+            output = root / "accuracy"
+            with patch("builtins.print"):
+                summary = build_accuracy_refinement(
+                    source,
+                    output,
+                    count=1024,
+                    train_sessions=2,
+                    train_turns=32,
+                    dev_count=64,
+                    dev_sessions=1,
+                    dev_turns=32,
+                    test_count=64,
+                    test_sessions=1,
+                    test_turns=40,
+                )
+            rows = [
+                json.loads(line)
+                for line in (output / "examples.jsonl").read_text().splitlines()
+            ]
+            train = [row for row in rows if row["split"] == "train"]
+            self.assertEqual(len(train), 1024)
+            self.assertEqual(len({accuracy_fingerprint(row) for row in train}), 1024)
+            self.assertEqual(summary["strata"], accuracy_quotas(1024))
+            self.assertEqual(set(summary["tools"]), set(ACTION_MODELS))
+            self.assertGreater(summary["training_sessions"], 0)
+            self.assertEqual(summary["minimum_updates_for_one_pass"], 128)
+            self.assertIn(validation, rows)
+            self.assertNotIn(old_test, rows)
+            self.assertNotIn(obsolete, rows)
+            self.assertEqual(
+                (output / "historical-test-examples.jsonl").read_text(), raw_test
+            )
+            self.assertEqual(
+                (output / "historical-valid-sessions.jsonl").read_text(),
+                json.dumps(historical_case) + "\n",
+            )
+            self.assertTrue(
+                summary["fresh_test"]["reserved_before_training_generation"]
+            )
+            self.assertEqual(
+                summary["splits"], {"train": 1024, "valid": 97, "test": 104}
+            )
+            test_rows = [row for row in rows if row["split"] == "test"]
+            reserved = [
+                json.loads(line)
+                for line in (output / "reserved-test-examples.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(
+                {row["id"] for row in test_rows}, {row["id"] for row in reserved}
+            )
+            self.assertTrue(
+                all(
+                    row["wording_family"].startswith("accuracy-test:")
+                    for row in reserved
+                )
+            )
+            by_id = {row["id"]: row for row in rows}
+            for line in (output / "sessions.jsonl").read_text().splitlines():
+                case = json.loads(line)
+                self.assertNotEqual(case["id"], historical_case["id"])
+                session = CanvasSession(case["initial_canvas"])
+                for turn, step in enumerate(case["turns"]):
+                    session.external(step["before"])
+                    row = by_id[step["id"]]
+                    self.assertEqual(session.canvas, row["canvas"])
+                    self.assertEqual(session.history, row["history"])
+                    session.execute(
+                        step["command"],
+                        step["expected"],
+                        f"{case['id']}:created-{turn}",
+                    )
+            pan = [row for row in train if row["expected"]["name"] == "pan_canvas"]
+            self.assertGreaterEqual(
+                len({row["wording_family"].split(":correction")[0] for row in pan}), 4
+            )
+            self.assertTrue(any("Scroll the view" in row["command"] for row in pan))
+            self.assertTrue(any("Move the viewport" in row["command"] for row in pan))
+            moves = [row for row in train if row["expected"]["name"] == "move_shapes"]
+            self.assertTrue(all("viewport" not in row["command"] for row in moves))
+
+    def test_accuracy_dataset_requires_one_complete_batch_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "existing"
+            output.mkdir()
+            source = Path(directory) / "unused.jsonl"
+            with self.assertRaisesRegex(ValueError, "divisible"):
+                build_accuracy_refinement(source, output, count=49)
+            with self.assertRaises(FileExistsError):
+                build_accuracy_refinement(source, output, count=48)
+
+
+class CheckpointSelectionRecoveryTests(unittest.TestCase):
+    def completed_run(self, root, *, promoted=True):
+        import hashlib
+
+        import numpy as np
+        from safetensors.numpy import save_file
+
+        launch = {
+            "updates": 3000,
+            "checkpoint_selection_steps": [500, 1500, 3000],
+            "dataset_sha256": "data",
+            "task_sha256": "task",
+        }
+        download = root / "download"
+        digests = {}
+        for case, step, value in (
+            ("baseline", 0, 0.0),
+            ("selected", 500, 1.0),
+            ("dual-window", 3000, 3.0),
+        ):
+            folder = download / "refinement" / case
+            adapter = folder / "adapter"
+            adapter.mkdir(parents=True)
+            weights = {"weight": np.asarray([value], dtype=np.float32)}
+            save_file(weights, str(adapter / "adapters.safetensors"))
+            digests[case] = hashlib.sha256(
+                (adapter / "adapters.safetensors").read_bytes()
+            ).hexdigest()
+            (adapter / "adapter_config.json").write_text("{}")
+            (folder / "config.yaml").write_text("evaluate_guards: true\n")
+            if step:
+                checkpoint = adapter / "checkpoints" / f"{step:07d}"
+                checkpoint.mkdir(parents=True)
+                save_file(weights, str(checkpoint / "adapters.safetensors"))
+                (checkpoint / "progress.json").write_text(
+                    json.dumps(
+                        {
+                            "step": step,
+                            "dataset_sha256": "data",
+                            "task_sha256": "task",
+                        }
+                    )
+                )
+        launch["warm_start_sha256"] = digests["baseline"]
+        (root / "run.json").write_text(json.dumps(launch))
+        (download / "refinement-training.json").write_text(
+            json.dumps(
+                {
+                    **launch,
+                    "end_step": 3000,
+                    "initialization": "weights_only",
+                    "training_finite": True,
+                }
+            )
+        )
+        (download / "checkpoint-selection.json").write_text(
+            json.dumps(
+                {
+                    "chosen_step": 500,
+                    "chosen_adapter_sha256": digests["selected"],
+                    "dataset_sha256": "data",
+                    "task_sha256": "task",
+                    "promotion_passed": promoted,
+                    "test_set_used": False,
+                }
+            )
+        )
+        return launch, digests
+
+    def test_recovery_retains_the_validated_earlier_checkpoint_and_rejects_tampering(
+        self,
+    ):
+        from kaggle_follow import finish_workflow, verify_workflow_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, digests = self.completed_run(root)
+            with patch("kaggle_follow.cli"):
+                finish_workflow("owner/kernel", root, training_only=True)
+            launch = json.loads((root / "run.json").read_text())
+            self.assertEqual(launch["selected_step"], 500)
+            self.assertEqual(launch["adapter_sha256"], digests["selected"])
+            self.assertNotEqual(launch["adapter_sha256"], digests["dual-window"])
+            _, weights = verify_workflow_checkpoint(root / "download", launch)
+            self.assertEqual(weights.parent.parent.name, "selected")
+            progress = weights.parent / "checkpoints/0000500/progress.json"
+            progress.write_text(
+                json.dumps(
+                    {"step": 1500, "dataset_sha256": "data", "task_sha256": "task"}
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint"):
+                verify_workflow_checkpoint(root / "download", launch)
+
+    def test_failed_promotion_retains_baseline_and_leaves_fresh_holdout_unused(self):
+        from kaggle_follow import (
+            await_final_scoring,
+            finish_workflow,
+            launch_final_scoring,
+            verify_native,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, digests = self.completed_run(root, promoted=False)
+            with (
+                patch("kaggle_follow.cli"),
+                patch("gpu_benchmark.quality_comparison") as compare,
+            ):
+                finish_workflow("owner/kernel", root)
+                compare.assert_not_called()
+            launch = json.loads((root / "run.json").read_text())
+            self.assertEqual(launch["adapter_sha256"], digests["baseline"])
+            self.assertNotIn("selected_step", launch)
+            self.assertFalse(launch["test_set_used"])
+            with patch("kaggle_follow.launch_final_scoring") as score:
+                await_final_scoring(root)
+                score.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "promotion gate"):
+                launch_final_scoring(root)
+            with self.assertRaisesRegex(ValueError, "validation gate"):
+                verify_native(root)
+            self.assertFalse((root / "final-score").exists())
+
+    def test_completed_training_requires_verified_exposure_of_every_training_row(self):
+        from kaggle_follow import verify_workflow_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launch, _ = self.completed_run(root)
+            launch["training_examples"] = 24000
+            result_path = root / "download/refinement-training.json"
+            result = json.loads(result_path.read_text())
+            result["training_batch_sha256"] = "batches"
+            result_path.write_text(json.dumps(result))
+            exposure_path = (
+                root / "download/refinement/dual-window/training-exposure.json"
+            )
+            exposure = {
+                "dataset_sha256": "data",
+                "task_sha256": "task",
+                "training_batch_sha256": "batches",
+                "updates": 3000,
+                "training_examples": 24000,
+                "selected_positions": 24000,
+                "unique_examples": 24000,
+                "coverage_fraction": 1.0,
+                "selected_ids": [f"train-{index}" for index in range(24000)],
+            }
+            exposure_path.write_text(json.dumps(exposure))
+            verify_workflow_checkpoint(root / "download", launch)
+            for changes in (
+                {"selected_ids": exposure["selected_ids"][:-1]},
+                {"unique_examples": 16000, "coverage_fraction": 2 / 3},
+                {"training_batch_sha256": "other"},
+            ):
+                exposure_path.write_text(json.dumps({**exposure, **changes}))
+                with self.assertRaisesRegex(ValueError, "cover"):
+                    verify_workflow_checkpoint(root / "download", launch)
+
+    def test_selected_scoring_recovers_chosen_weights_without_losing_training_final(
+        self,
+    ):
+        from gpu_benchmark import resume_refinement_evaluation
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launch, digests = self.completed_run(root)
+            expected = {
+                **launch,
+                "selected_step": 500,
+                "promotion_passed": True,
+                "adapter_sha256": digests["selected"],
+                "native_verification": "passed",
+            }
+            working = root / "scoring"
+            working.mkdir()
+
+            def score(_root, output, *, selected):
+                self.assertTrue(selected)
+                for name in (
+                    "valid",
+                    "sessions-valid",
+                    "valid-guarded",
+                    "sessions-valid-guarded",
+                    "test-guarded",
+                    "sessions-test-guarded",
+                ):
+                    (output / "dual-window" / f"{name}.json").write_text(
+                        json.dumps(
+                            {
+                                "adapter_sha256": digests["selected"],
+                                "examples": [],
+                            }
+                        )
+                    )
+
+            with (
+                patch("lab._metadata", return_value=launch),
+                patch("gpu_benchmark.evaluate_pair", side_effect=score) as evaluate,
+                patch("gpu_benchmark.run_case") as train,
+            ):
+                resume_refinement_evaluation(
+                    root, working, expected, source=root / "download", selected=True
+                )
+                train.assert_not_called()
+                evaluate.assert_called_once_with(
+                    root, working / "refinement", selected=True
+                )
+            report = json.loads(
+                (working / "refinement-selected-evaluation.json").read_text()
+            )
+            self.assertEqual(report["adapter_sha256"], digests["selected"])
+            chosen = working / "refinement/dual-window/adapter/adapters.safetensors"
+            self.assertEqual(
+                chosen.read_bytes(),
+                (
+                    root / "download/refinement/selected/adapter/adapters.safetensors"
+                ).read_bytes(),
+            )
+            self.assertEqual(
+                (
+                    working / "refinement/training-final/adapter/adapters.safetensors"
+                ).read_bytes(),
+                (
+                    root
+                    / "download/refinement/dual-window/adapter/adapters.safetensors"
+                ).read_bytes(),
+            )
+            verify = __import__("kaggle_follow").verify_workflow_checkpoint
+            _, selected = verify(working, expected)
+            self.assertEqual(selected.parent.parent.name, "selected")
 
 
 class WorkflowTests(unittest.TestCase):

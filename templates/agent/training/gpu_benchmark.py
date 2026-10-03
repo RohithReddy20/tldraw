@@ -135,7 +135,7 @@ def representative_batches(path, verify=False):
     return batches
 
 
-def quality_batches(path, seed, resume_step, updates=500):
+def quality_batches(path, seed, resume_step, updates=500, *, exposure_path=None):
     import numpy as np
 
     with np.load(path) as arrays:
@@ -143,6 +143,8 @@ def quality_batches(path, seed, resume_step, updates=500):
             arrays[name] for name in ("tokens", "boundaries", "offsets")
         ]
     sizes = np.diff(boundaries)
+    if len(sizes) < 8 or updates < 1 or resume_step < 0:
+        raise ValueError("Quality batches require eight rows and positive updates.")
     order = np.argsort(sizes, kind="stable")
     groups = order[: len(order) // 8 * 8].reshape(-1, 8)
     random = np.random.RandomState(seed)
@@ -164,6 +166,21 @@ def quality_batches(path, seed, resume_step, updates=500):
                     break
             step += 1
     digest = hashlib.sha256(np.asarray(selected, dtype="<i8").tobytes()).hexdigest()
+    if exposure_path is not None:
+        from training import write_training_exposure
+
+        exposure = write_training_exposure(
+            path, selected, len(sizes), seed, resume_step, updates
+        )
+        exposure["training_batch_sha256"] = digest
+        metadata_path = path.with_name("tokens.json")
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            exposure.update(
+                {key: metadata[key] for key in ("dataset_sha256", "task_sha256")}
+            )
+        exposure_path.parent.mkdir(parents=True, exist_ok=True)
+        exposure_path.write_text(json.dumps(exposure, indent=2))
     return batches, digest
 
 
@@ -275,6 +292,9 @@ def worker(root, output, case, verify=False, quality=False):
             config["seed"],
             resume["step"],
             updates=config.get("quality_updates", 500),
+            exposure_path=output / "training-exposure.json"
+            if rank == 0 and config.get("checkpoint_selection_steps")
+            else None,
         )
     else:
         raw_batches = representative_batches(root / "data/tokens-train.npz", verify)
@@ -386,7 +406,11 @@ def worker(root, output, case, verify=False, quality=False):
             if (
                 warm_start
                 and rank == 0
-                and (completed == 50 or completed % config.get("save_every", 500) == 0)
+                and (
+                    completed == 50
+                    or completed % config.get("save_every", 500) == 0
+                    or completed in config.get("checkpoint_selection_steps", [])
+                )
             ):
                 save_training_checkpoint(
                     model,
@@ -713,14 +737,18 @@ def run_case(root, output, case, verify=False, quality=False):
     return compare(reference, folder)
 
 
-def quality_comparison(baseline, candidate, *, guarded=False):
+def quality_comparison(baseline, candidate, *, guarded=False, report_prefix=""):
     from sessions import summarize_sessions
 
     result = {}
     for name in ("valid", "sessions-valid"):
         suffix = "-guarded" if guarded else ""
-        before = json.loads((baseline / f"{name}{suffix}.json").read_text())
-        after = json.loads((candidate / f"{name}{suffix}.json").read_text())
+        before = json.loads(
+            (baseline / f"{report_prefix}{name}{suffix}.json").read_text()
+        )
+        after = json.loads(
+            (candidate / f"{report_prefix}{name}{suffix}.json").read_text()
+        )
         if (
             before.get("execution_guards", False) != guarded
             or after.get("execution_guards", False) != guarded
@@ -789,12 +817,269 @@ def quality_comparison(baseline, candidate, *, guarded=False):
     return result
 
 
+def checkpoint_selection_settings(config):
+    steps = config["checkpoint_selection_steps"]
+    updates = config.get("quality_updates", 500)
+    if (
+        not isinstance(steps, list)
+        or not 1 <= len(steps) <= 3
+        or any(
+            type(step) is not int or not 1 <= step <= updates or step % 50
+            for step in steps
+        )
+        or len(set(steps)) != len(steps)
+    ):
+        raise ValueError(
+            "Checkpoint selection requires up to three reported update steps."
+        )
+    for key, size in (("selection_example_ids", 256), ("selection_session_ids", 6)):
+        identifiers = config.get(key)
+        if (
+            not isinstance(identifiers, list)
+            or len(identifiers) != size
+            or any(
+                not isinstance(identifier, str) or not identifier
+                for identifier in identifiers
+            )
+            or len(set(identifiers)) != size
+        ):
+            raise ValueError(f"{key} must contain {size} unique validation IDs.")
+    return sorted(steps)
+
+
+def checkpoint_metrics(folder, *, selection=False):
+    from sessions import summarize_sessions
+    from training import action_stratum
+
+    prefix = "selection-" if selection else ""
+    command = json.loads((folder / f"{prefix}valid-guarded.json").read_text())
+    session = json.loads((folder / f"{prefix}sessions-valid-guarded.json").read_text())
+    if any(
+        report["split"] != "valid" or not report.get("execution_guards")
+        for report in (command, session)
+    ):
+        raise ValueError("Checkpoint selection must use guarded validation only.")
+    if selection:
+        import yaml
+
+        config = yaml.safe_load((folder / "config.yaml").read_text())
+        checkpoint_selection_settings(config)
+        if (
+            len(command["examples"]) != len(config["selection_example_ids"])
+            or {row["id"] for row in command["examples"]}
+            != set(config["selection_example_ids"])
+            or {row["session_id"] for row in session["examples"]}
+            != set(config["selection_session_ids"])
+        ):
+            raise ValueError(
+                "Checkpoint reports do not cover the selected validation IDs."
+            )
+    strata = {}
+    for row in command["examples"]:
+        count = strata.setdefault(
+            action_stratum(row["expected"]), {"correct": 0, "total": 0}
+        )
+        count["total"] += 1
+        count["correct"] += row["correct"]
+    sessions = summarize_sessions(session["examples"])
+    result = {
+        "command_accuracy": sum(row["correct"] for row in command["examples"])
+        / len(command["examples"]),
+        "session_action_accuracy": sessions["exact_action_accuracy"],
+        **{
+            key: sessions[key]
+            for key in (
+                "state_agreement_rate",
+                "perfect_sessions",
+                "final_state_matches",
+                "unwanted_mutations",
+            )
+        },
+        "per_stratum": dict(sorted(strata.items())),
+        "adapter_sha256": command["adapter_sha256"],
+    }
+    if result["adapter_sha256"] != session["adapter_sha256"]:
+        raise ValueError(
+            "Command and session selection reports score different adapters."
+        )
+    result["joint_score"] = (
+        sum(
+            result[key]
+            for key in (
+                "command_accuracy",
+                "session_action_accuracy",
+                "state_agreement_rate",
+            )
+        )
+        / 3
+    )
+    return result
+
+
+def checkpoint_regressions(baseline, candidate):
+    if set(baseline["per_stratum"]) != set(candidate["per_stratum"]):
+        raise ValueError("Checkpoint metrics use different validation strata.")
+    regressions = []
+    for key in (
+        "command_accuracy",
+        "session_action_accuracy",
+        "state_agreement_rate",
+        "perfect_sessions",
+        "final_state_matches",
+    ):
+        if candidate[key] < baseline[key]:
+            regressions.append(key)
+    if candidate["unwanted_mutations"] > baseline["unwanted_mutations"]:
+        regressions.append("unwanted_mutations")
+    for key, old in baseline["per_stratum"].items():
+        new = candidate["per_stratum"][key]
+        if new["total"] != old["total"]:
+            raise ValueError("Checkpoint metrics use different validation counts.")
+        if new["correct"] < old["correct"]:
+            regressions.append(f"stratum:{key}")
+    return regressions
+
+
+def choose_checkpoint(baseline, candidates):
+    eligible, rejected = [], {}
+    for step, candidate in candidates.items():
+        regressions = checkpoint_regressions(baseline, candidate)
+        if not regressions and candidate["joint_score"] > baseline["joint_score"]:
+            eligible.append(step)
+        else:
+            rejected[str(step)] = regressions or ["no_joint_improvement"]
+    chosen = (
+        max(eligible, key=lambda step: (candidates[step]["joint_score"], -step))
+        if eligible
+        else 0
+    )
+    return {
+        "chosen_step": chosen,
+        "eligible_steps": sorted(eligible),
+        "rejected_steps": rejected,
+    }
+
+
+def export_checkpoint(source, destination, step, metadata):
+    checkpoint = source / "adapter/checkpoints" / f"{step:07d}"
+    progress = json.loads((checkpoint / "progress.json").read_text())
+    if progress["step"] != step or any(
+        progress[key] != metadata[key] for key in ("dataset_sha256", "task_sha256")
+    ):
+        raise ValueError(
+            "Selection checkpoint differs from the requested step or task."
+        )
+    adapter = destination / "adapter"
+    adapter.mkdir(parents=True, exist_ok=False)
+    shutil.copyfile(source / "config.yaml", destination / "config.yaml")
+    shutil.copyfile(
+        source / "adapter/adapter_config.json", adapter / "adapter_config.json"
+    )
+    shutil.copyfile(
+        checkpoint / "adapters.safetensors", adapter / "adapters.safetensors"
+    )
+    shutil.copytree(checkpoint, adapter / "checkpoints" / f"{step:07d}")
+
+
+def select_refinement_checkpoint(root, working, config):
+    steps = checkpoint_selection_settings(config)
+    output = working / "refinement"
+    baseline = output / "baseline"
+    final = output / "dual-window"
+    metadata = json.loads((root / "data/tokens.json").read_text())
+    candidates = {}
+    for step in steps:
+        folder = output / "checkpoint-selection" / f"step-{step}"
+        export_checkpoint(final, folder, step, metadata)
+        candidates[step] = folder
+    folders = [
+        ("baseline", baseline),
+        *((f"step-{step}", candidates[step]) for step in steps),
+    ]
+    for offset in range(0, len(folders), 2):
+        evaluate_pair(
+            root, output, folders=dict(folders[offset : offset + 2]), selection=True
+        )
+    before = checkpoint_metrics(baseline, selection=True)
+    metrics = {}
+    for step, folder in candidates.items():
+        quality_comparison(baseline, folder, guarded=True, report_prefix="selection-")
+        metrics[step] = checkpoint_metrics(folder, selection=True)
+    result = {
+        **choose_checkpoint(before, metrics),
+        "baseline": before,
+        "candidates": {str(step): value for step, value in metrics.items()},
+        "selection_example_ids": config["selection_example_ids"],
+        "selection_session_ids": config["selection_session_ids"],
+        "dataset_sha256": metadata["dataset_sha256"],
+        "task_sha256": metadata["task_sha256"],
+        "selection_criteria": {
+            "score": (
+                "Mean of command accuracy, session action accuracy, "
+                "and canvas state agreement"
+            ),
+            "regression_gate": (
+                "No decreases in tool/operation/reason correctness, action accuracy, "
+                "state agreement, perfect/final-state sessions; "
+                "no additional unwanted mutations"
+            ),
+            "ties": "Earlier checkpoint",
+            "full_validation_required": True,
+        },
+        "promotion_passed": False,
+        "chosen_adapter_sha256": before["adapter_sha256"],
+        "full_validation": None,
+        "test_set_used": False,
+    }
+    step = result["chosen_step"]
+    if step:
+        selected = output / "selected"
+        export_checkpoint(final, selected, step, metadata)
+        result["chosen_adapter_sha256"] = hashlib.sha256(
+            (selected / "adapter/adapters.safetensors").read_bytes()
+        ).hexdigest()
+        if result["chosen_adapter_sha256"] != metrics[step]["adapter_sha256"]:
+            raise ValueError("Selected export differs from the scored checkpoint.")
+        evaluate_pair(
+            root, output, folders={"baseline": baseline, "selected": selected}
+        )
+        comparison = quality_comparison(baseline, selected, guarded=True)
+        full_before, full_after = (
+            checkpoint_metrics(baseline),
+            checkpoint_metrics(selected),
+        )
+        regressions = checkpoint_regressions(full_before, full_after)
+        result["full_validation"] = {
+            "baseline": full_before,
+            "selected": full_after,
+            "comparison": comparison,
+            "regressions": regressions,
+        }
+        result["promotion_passed"] = bool(
+            comparison["no_observed_accuracy_drop"] and not regressions
+        )
+    (working / "checkpoint-selection.json").write_text(json.dumps(result, indent=2))
+    print(
+        "CHECKPOINT SELECTION "
+        + json.dumps(
+            {
+                key: result[key]
+                for key in ("chosen_step", "chosen_adapter_sha256", "promotion_passed")
+            }
+        ),
+        flush=True,
+    )
+    return result
+
+
 def refinement_experiment(root, working, *, training_only=False):
     import yaml
 
     if not (root / "warm-start.json").exists():
         raise ValueError("Refinement requires verified weights and a fresh optimizer.")
     config = yaml.safe_load((root / "config.yaml").read_text())
+    if config.get("checkpoint_selection_steps"):
+        checkpoint_selection_settings(config)
     output = working / "refinement"
     baseline = output / "baseline"
     (baseline / "adapter").mkdir(parents=True, exist_ok=False)
@@ -813,6 +1098,9 @@ def refinement_experiment(root, working, *, training_only=False):
         raise RuntimeError(
             "Refinement training failed; the original adapter is retained."
         )
+    if config.get("checkpoint_selection_steps"):
+        select_refinement_checkpoint(root, working, config)
+        return
     if training_only:
         print(
             "Refinement training complete; checkpoint ready for native checks.",
@@ -868,8 +1156,25 @@ def resume_refinement_evaluation(
     ):
         raise ValueError("Evaluation baseline differs from the retained model.")
     output = working / "refinement"
+    retained_step = expected.get("selected_step", expected["updates"])
+    selected_source = source / "refinement/selected"
+    if "selected_step" in expected:
+        if not expected.get("promotion_passed"):
+            raise ValueError(
+                "Selected checkpoint scoring requires a passed promotion gate."
+            )
+        shutil.copytree(selected_source, output / "selected")
+        shutil.copyfile(
+            source / "checkpoint-selection.json", working / "checkpoint-selection.json"
+        )
+        shutil.copytree(source / "refinement/dual-window", output / "training-final")
     for case in ("baseline", "dual-window"):
-        origin, destination = source / "refinement" / case, output / case
+        origin = (
+            selected_source
+            if case == "dual-window" and "selected_step" in expected
+            else source / "refinement" / case
+        )
+        destination = output / case
         (destination / "adapter").mkdir(parents=True)
         for filename in (
             "config.yaml",
@@ -895,9 +1200,14 @@ def resume_refinement_evaluation(
                 (destination / "adapter/adapters.safetensors").read_bytes()
             ).hexdigest()
             (destination / "valid.json").write_text(json.dumps(report, indent=2))
-    checkpoint = f"adapter/checkpoints/{expected['updates']:07d}"
+    checkpoint = f"adapter/checkpoints/{retained_step:07d}"
     shutil.copytree(
-        source / "refinement/dual-window" / checkpoint,
+        (
+            selected_source
+            if "selected_step" in expected
+            else source / "refinement/dual-window"
+        )
+        / checkpoint,
         output / "dual-window" / checkpoint,
     )
     shutil.copyfile(
@@ -996,11 +1306,23 @@ def quality_experiment(root, working):
     )
 
 
-def evaluate_pair(root, output, *, selected=False):
+def evaluate_pair(root, output, *, selected=False, folders=None, selection=False):
     evaluations = []
     handles = []
     log_paths = {}
-    cases = ("valid", "test") if selected else ("baseline", "dual-window")
+    if selected and (folders is not None or selection):
+        raise ValueError(
+            "Final test scoring must not be mixed with checkpoint selection."
+        )
+    if folders is not None and not 1 <= len(folders) <= 2:
+        raise ValueError("Validation evaluation requires one or two GPU workers.")
+    cases = (
+        tuple(folders)
+        if folders is not None
+        else ("valid", "test")
+        if selected
+        else ("baseline", "dual-window")
+    )
     try:
         # Concurrent conversion can expose an unfinished checkpoint to the other worker.
         from lab import model_path
@@ -1010,9 +1332,19 @@ def evaluate_pair(root, output, *, selected=False):
             environment = {**os.environ, "CUDA_VISIBLE_DEVICES": str(device)}
             environment.pop("MLX_RANK", None)
             environment.pop("MLX_WORLD_SIZE", None)
-            folder = output / "dual-window" if selected else output / case
+            folder = (
+                folders[case]
+                if folders is not None
+                else output / "dual-window"
+                if selected
+                else output / case
+            )
             log_paths[case] = folder / (
-                f"evaluation-{case}.log" if selected else "evaluation.log"
+                f"evaluation-{case}.log"
+                if selected
+                else "selection-evaluation.log"
+                if selection
+                else "evaluation.log"
             )
             log = log_paths[case].open("w")
             handles.append(log)
@@ -1027,10 +1359,12 @@ def evaluate_pair(root, output, *, selected=False):
                         "--output",
                         str(folder),
                         "--case",
-                        "dual-window" if selected else case,
+                        "baseline" if case == "baseline" else "dual-window",
                         *(
                             ["--score-split", case]
                             if selected
+                            else ["--evaluate-selection"]
+                            if selection
                             else ["--evaluate-quality"]
                         ),
                     ],
@@ -1065,6 +1399,40 @@ def evaluate_pair(root, output, *, selected=False):
             process.wait()
         for log in handles:
             log.close()
+
+
+def evaluate_checkpoint_selection(output):
+    import mlx.core as mx
+    import yaml
+
+    from lab import evaluate, evaluate_sessions
+
+    if mx.default_device() != mx.gpu:
+        raise RuntimeError("Checkpoint selection requires the CUDA GPU.")
+    config = yaml.safe_load((output / "config.yaml").read_text())
+    checkpoint_selection_settings(config)
+    digest = hashlib.sha256(
+        (output / "adapter/adapters.safetensors").read_bytes()
+    ).hexdigest()
+    for function, name in ((evaluate, "valid"), (evaluate_sessions, "sessions-valid")):
+        path = output / f"selection-{name}-guarded.json"
+        function(
+            argparse.Namespace(
+                split="valid",
+                adapter=output / "adapter",
+                output=path,
+                limit=None,
+                guarded=True,
+                cache_prefix=True,
+                batch_size=8 if function is evaluate else 1,
+                example_ids=config["selection_example_ids"],
+                session_ids=config["selection_session_ids"],
+            )
+        )
+        report = json.loads(path.read_text())
+        report["adapter_sha256"] = digest
+        path.write_text(json.dumps(report, indent=2))
+        mx.clear_cache()
 
 
 def evaluate_quality(output):
@@ -1232,9 +1600,14 @@ if __name__ == "__main__":
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--evaluate-quality", action="store_true")
+    parser.add_argument("--evaluate-selection", action="store_true")
     parser.add_argument("--score-split", choices=("valid", "test"))
     args = parser.parse_args()
-    if args.score_split:
+    if args.evaluate_selection:
+        if args.score_split or args.evaluate_quality:
+            parser.error("Checkpoint selection accepts validation subsets only.")
+        evaluate_checkpoint_selection(args.output)
+    elif args.score_split:
         score_selected_split(args.output, args.score_split)
     elif args.evaluate_quality:
         evaluate_quality(args.output)

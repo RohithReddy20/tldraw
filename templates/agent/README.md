@@ -168,6 +168,51 @@ uv run --project templates/agent/training python templates/agent/training/kaggle
 runs the model integration tests, and saves results under `native-check/`. It
 releases the service afterward and retains the verified adapter if a check fails.
 
+### Accuracy refinement
+
+The version-seven data audit found that version six trained on 16,000 example
+positions, only 13.6% of its 117,600 generated rows. Some arrangement operations
+received seven or eight examples; panning had one training sentence construction
+and was omitted from spoken augmentation. The retained dataset also contained
+duplicate prompts and a few obsolete unsupported-action labels.
+
+`build_workflow.py --accuracy-refinement 24000 --seed 66` builds a new corpus from
+the frozen version-six source. It balances all 18 tools, all 20 arrangement
+operations, eight canvas commands, and three rejection reasons. Training inputs
+are unique, with separate train, development, and test names and sentence
+constructions. Sequential examples include manual edits, selection changes,
+undo/redo, stale references, and recovery. Native capability checks reject labels
+that request unsupported fills, frame colors, or note resizing; note dimensions
+and text height are not requested as controllable dimensions. Actions are checked
+against their captured context, and complete sessions are replayed before export.
+
+Historical validation and test artifacts are preserved separately. Twelve
+historical command-validation rows with incompatible native capability labels are
+excluded from current validation; historical session oracles are excluded because
+they omitted visible connection arrows and used different context ordering.
+Current development has 1,700 command examples and eight sessions totaling 256
+turns. A new test reservation contains 980 command examples, including the oracle
+contexts for 12 sessions totaling 480 turns. It is created and hashed before
+training examples are generated. These synthetic tests do not establish accuracy
+on unstructured human speech or pixel-perfect layouts.
+
+`training/accuracy-config.yaml` retains FunctionGemma 270M and rank-32 LoRA, with a
+fresh optimizer, learning rate 0.00001, global batch eight, and 3,000 updates. That
+is one complete pass over the 24,000 rows. `training-exposure.json` records the
+selected IDs and action counts; checkpoint recovery verifies complete coverage.
+Validation selects among updates 500, 1,500, and 3,000 using 256 fixed development
+IDs and six development sessions, then compares the chosen model with the retained
+baseline on full validation. The original final checkpoint is preserved, and no
+candidate replaces the baseline after an observed action or state regression.
+Fresh tests run only after that gate and native integration checks pass. State
+reports now separate document, selection, and camera agreement.
+
+The workflow follows Google's [FunctionGemma fine-tuning guidance](https://ai.google.dev/gemma/docs/functiongemma/finetuning-with-functiongemma).
+The [APIGen paper](https://arxiv.org/abs/2406.18518) provides a reference for checking
+function-call data through format, execution, and semantic validation. The checks
+here are authored rules and simulator replay, rather than independent human
+review of every example.
+
 ## Local action-model training
 
 The `training/` directory is a Python lab for learning to fine-tune a small instruction

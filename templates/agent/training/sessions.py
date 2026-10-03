@@ -3,13 +3,21 @@ from collections import defaultdict
 
 from actions import Canvas, CanvasShape, SchemaBox, validate_call
 
+SIMULATOR_VERSION = "native-visible-shapes-v2"
+
 
 class CanvasSession:
     def __init__(self, canvas):
         self.canvas = Canvas.model_validate(canvas).model_dump()
+        self.normalize_context()
         self.connections = []
         self.history = {"turns": [], "last_created_id": None, "last_edited_id": None}
         self.undo_stack, self.redo_stack = [], []
+
+    def normalize_context(self):
+        for kind in ("schemas", "shapes"):
+            self.canvas[kind].sort(key=lambda shape: shape["id"])
+        self.canvas["selected_ids"].sort()
 
     def objects(self):
         return {
@@ -49,6 +57,14 @@ class CanvasSession:
                 return ids
             ids = expanded
 
+    def style_targets(self, targets):
+        objects = self.objects()
+        return [
+            objects[identifier]
+            for identifier in sorted(self.descendants(targets))
+            if objects[identifier].get("kind") != "group"
+        ]
+
     def delete(self, ids):
         ids = self.descendants(ids)
         for kind in ("schemas", "shapes"):
@@ -59,7 +75,9 @@ class CanvasSession:
         self.connections = [
             link
             for link in self.connections
-            if not ids.intersection((link["source_id"], link["target_id"]))
+            if not ids.intersection(
+                (link["shape_id"], link["source_id"], link["target_id"])
+            )
         ]
 
     def external(self, events):
@@ -87,8 +105,10 @@ class CanvasSession:
                 shape["name"] = event["text"][:100]
                 if "text" in shape:
                     shape["text"] = event["text"]
+                    shape["name"] = shape["name"] or shape_name(shape["kind"])
             else:
                 raise ValueError(f"Unknown external event: {kind}")
+            self.normalize_context()
             if kind in ("delete", "move", "text") and self.document() != before:
                 self.undo_stack.append(before)
                 self.redo_stack.clear()
@@ -142,7 +162,7 @@ class CanvasSession:
                     self.canvas["shapes"].append(
                         CanvasShape(
                             id=created_id,
-                            name=args["text"][:100] or args["kind"],
+                            name=args["text"][:100] or shape_name(args["kind"]),
                             kind=args["kind"],
                             text=args["text"],
                             x=args["x"] or 0,
@@ -155,8 +175,30 @@ class CanvasSession:
                 target, made, document_edit = created_id, True, True
                 self.canvas["selected_ids"] = [created_id]
             elif name == "connect_schemas":
-                if args not in self.connections:
-                    self.connections.append(copy.deepcopy(args))
+                if not any(
+                    all(link[key] == value for key, value in args.items())
+                    for link in self.connections
+                ):
+                    if created_id in objects:
+                        raise ValueError("Creation reuses an ID.")
+                    source, destination = (
+                        objects[args[key]] for key in ("source_id", "target_id")
+                    )
+                    x, y = source["x"] + source["w"] / 2, source["y"] + source["h"] / 2
+                    self.canvas["shapes"].append(
+                        CanvasShape(
+                            id=created_id,
+                            name=args["label"] or "arrow",
+                            kind="arrow",
+                            text=args["label"],
+                            x=x,
+                            y=y,
+                            w=max(1, abs(destination["x"] + destination["w"] / 2 - x)),
+                            h=max(1, abs(destination["y"] + destination["h"] / 2 - y)),
+                            order=len(objects),
+                        ).model_dump()
+                    )
+                    self.connections.append({**args, "shape_id": created_id})
                 target, document_edit = args["source_id"], True
                 self.canvas["selected_ids"] = [target]
             elif name == "select_shapes":
@@ -202,10 +244,10 @@ class CanvasSession:
                         objects[identifier]["y"] += args["dy"]
                     target = ids[0]
                 else:
-                    for identifier in self.descendants(ids):
+                    for shape in self.style_targets(ids):
                         for style in ("color", "fill", "opacity"):
-                            if args[style] is not None:
-                                objects[identifier][style] = args[style]
+                            if args[style] is not None and supports_style(shape, style):
+                                shape[style] = args[style]
                     target = ids[0]
                 document_edit = True
                 if name != "delete_shapes":
@@ -219,7 +261,7 @@ class CanvasSession:
                     shape["name"] = args["text"]
                 else:
                     shape["text"] = args["text"]
-                    shape["name"] = args["text"][:100] or shape["kind"]
+                    shape["name"] = args["text"][:100] or shape_name(shape["kind"])
                 self.canvas["selected_ids"] = [target]
                 document_edit = True
             elif name == "arrange_shapes":
@@ -241,6 +283,7 @@ class CanvasSession:
                     box["h"] = schema_height(box["properties"], box["methods"])
                 self.canvas["selected_ids"] = [target]
                 document_edit = True
+        self.normalize_context()
         if document_edit:
             if self.document() != before:
                 self.undo_stack.append(before)
@@ -284,6 +327,16 @@ class CanvasSession:
                     if original in {s["id"] for s in self.canvas["schemas"]}
                     else "shapes"
                 ].append(shape)
+            self.connections.extend(
+                {
+                    **link,
+                    "shape_id": mapping[link["shape_id"]],
+                    "source_id": mapping.get(link["source_id"], link["source_id"]),
+                    "target_id": mapping.get(link["target_id"], link["target_id"]),
+                }
+                for link in self.connections[:]
+                if link["shape_id"] in mapping
+            )
             selected, made = [mapping[i] for i in ids], True
         elif operation == "group":
             x, y = min(s["x"] for s in shapes), min(s["y"] for s in shapes)
@@ -393,6 +446,33 @@ def schema_height(fields, methods):
     return 104 + max(1, len(fields)) * 24 + max(1, len(methods)) * 24
 
 
+def shape_name(kind):
+    return "geo" if kind in ("rectangle", "ellipse", "diamond", "triangle") else kind
+
+
+def supports_style(shape, style):
+    kind = shape.get("kind", "schema")
+    if kind == "group":
+        return False
+    if style == "opacity":
+        return True
+    filled = kind in ("schema", "rectangle", "ellipse", "diamond", "triangle", "arrow")
+    if style == "fill":
+        return filled
+    return style == "color" and (filled or kind in ("text", "note"))
+
+
+def compare_session_state(actual, expected):
+    return {
+        "state_matches": actual == expected,
+        "document_matches": all(
+            actual[key] == expected[key] for key in ("schemas", "shapes", "connections")
+        ),
+        "selection_matches": actual["selected_ids"] == expected["selected_ids"],
+        "camera_matches": actual["camera"] == expected["camera"],
+    }
+
+
 def summarize_sessions(rows):
     groups, positions = defaultdict(list), defaultdict(list)
     for row in rows:
@@ -406,11 +486,20 @@ def summarize_sessions(rows):
         for group in groups.values()
         for before, after in zip(group, group[1:], strict=False)
     )
+    agreements = {}
+    for component in ("document", "selection", "camera"):
+        field = f"{component}_matches"
+        agreements[f"{component}_agreement_rate"] = (
+            sum(r[field] for r in rows) / len(rows)
+            if all(field in r for r in rows)
+            else None
+        )
     return {
         "sessions": len(groups),
         "turns": len(rows),
         "exact_action_accuracy": sum(r["correct"] for r in rows) / len(rows),
         "state_agreement_rate": sum(r["state_matches"] for r in rows) / len(rows),
+        **agreements,
         "perfect_sessions": sum(
             all(r["correct"] for r in group) for group in groups.values()
         ),

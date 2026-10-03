@@ -1,12 +1,13 @@
 import copy
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from actions import messages_for, model_call, parse_call, validate_call
+from actions import messages_for, model_call, model_canvas, parse_call, validate_call
 from dataset import audit_examples, read_examples
 from lab import _summarize, verify_token_cache
 from sessions import CanvasSession, summarize_sessions
@@ -228,8 +229,9 @@ class SessionTests(unittest.TestCase):
             "Rename the last created box.", session.canvas, session.history
         )[1]["content"]
         self.assertEqual(len(session.history["turns"]), 3)
-        self.assertIn('"last_created_id": "box1"', prompt)
-        self.assertIn('"last_edited_id": "box1"', prompt)
+        _, identifiers = model_canvas(session.canvas)
+        self.assertIn(f'"last_created_id": "{identifiers["user"]}"', prompt)
+        self.assertIn(f'"last_edited_id": "{identifiers["user"]}"', prompt)
         session.external([{"kind": "delete", "id": "user"}])
         self.assertIn(
             '"last_created_id": null',
@@ -467,6 +469,338 @@ class RecoveryTests(unittest.TestCase):
                 chunks.append(content)
             self.assertEqual(
                 b"".join(chunks), (checkpoint / "checkpoint.zip").read_bytes()
+            )
+
+
+class CheckpointSelectionTests(unittest.TestCase):
+    def config(self):
+        return {
+            "quality_updates": 3000,
+            "checkpoint_selection_steps": [500, 1500, 3000],
+            "selection_example_ids": [f"valid-{index}" for index in range(256)],
+            "selection_session_ids": [f"session-{index}" for index in range(6)],
+        }
+
+    def metrics(self):
+        return {
+            "command_accuracy": 0.5,
+            "session_action_accuracy": 0.5,
+            "state_agreement_rate": 0.25,
+            "perfect_sessions": 0,
+            "final_state_matches": 0,
+            "unwanted_mutations": 0,
+            "joint_score": 1.25 / 3,
+            "per_stratum": {
+                "arrange_shapes:pack": {"correct": 1, "total": 2},
+                "move_shapes": {"correct": 3, "total": 6},
+            },
+        }
+
+    def test_selection_rejects_state_and_rare_operation_regressions(self):
+        from gpu_benchmark import choose_checkpoint
+
+        baseline = self.metrics()
+        state = {
+            **copy.deepcopy(baseline),
+            "command_accuracy": 0.9,
+            "state_agreement_rate": 0.1,
+            "joint_score": 0.5,
+        }
+        operation = copy.deepcopy(state)
+        operation["state_agreement_rate"] = 0.5
+        operation["per_stratum"]["arrange_shapes:pack"]["correct"] = 0
+        improved = {
+            **copy.deepcopy(baseline),
+            "command_accuracy": 0.75,
+            "joint_score": 1.5 / 3,
+        }
+        result = choose_checkpoint(
+            baseline, {500: state, 1500: operation, 3000: improved}
+        )
+        self.assertEqual(result["chosen_step"], 3000)
+        self.assertEqual(result["eligible_steps"], [3000])
+        self.assertIn("state_agreement_rate", result["rejected_steps"]["500"])
+        self.assertIn("stratum:arrange_shapes:pack", result["rejected_steps"]["1500"])
+        self.assertEqual(choose_checkpoint(baseline, {500: baseline})["chosen_step"], 0)
+        self.assertEqual(
+            choose_checkpoint(baseline, {1500: improved, 500: improved})["chosen_step"],
+            500,
+        )
+
+    def test_exposure_records_exact_consumed_rows_without_changing_batches(self):
+        import numpy as np
+
+        from gpu_benchmark import quality_batches
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            path = root / "data/tokens-train.npz"
+            np.savez(
+                path,
+                tokens=np.arange(16 * 4, dtype=np.int32),
+                boundaries=np.arange(17) * 4,
+                offsets=np.ones(16, dtype=np.int32),
+            )
+            rows = [
+                {
+                    "id": f"train-{index}",
+                    "split": "train",
+                    "expected": {
+                        "name": "canvas_command",
+                        "arguments": {"operation": "undo" if index % 2 else "redo"},
+                    },
+                    "provenance": "deliberate coverage",
+                }
+                for index in range(16)
+            ]
+            (root / "examples.jsonl").write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in [{"id": "valid", "split": "valid"}, *rows]
+                )
+            )
+            plain, digest = quality_batches(path, 77, 0, updates=2)
+            manifest = root / "training-exposure.json"
+            recorded, after = quality_batches(
+                path, 77, 0, updates=2, exposure_path=manifest
+            )
+            self.assertEqual(digest, after)
+            for before, actual in zip(plain, recorded, strict=True):
+                for a, b in zip(before, actual, strict=True):
+                    np.testing.assert_array_equal(a, b)
+            exposure = json.loads(manifest.read_text())
+            self.assertEqual(exposure["unique_examples"], 16)
+            self.assertEqual(exposure["coverage_fraction"], 1)
+            self.assertEqual(exposure["epoch_equivalents"], 1)
+            self.assertEqual(
+                exposure["selected_ids"],
+                [rows[index]["id"] for index in exposure["selected_indices"]],
+            )
+            self.assertEqual(
+                exposure["operation_counts"],
+                {"canvas_command:redo": 8, "canvas_command:undo": 8},
+            )
+            quality_batches(path, 77, 1, updates=1, exposure_path=manifest)
+            resumed = json.loads(manifest.read_text())
+            self.assertEqual(
+                resumed["selected_indices"], exposure["selected_indices"][8:]
+            )
+            self.assertEqual(resumed["coverage_fraction"], 0.5)
+
+    def test_opt_in_selection_runs_after_training_without_scoring_test(self):
+        import yaml
+
+        from gpu_benchmark import refinement_experiment
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            work = Path(directory) / "working"
+            root.mkdir()
+            work.mkdir()
+            (root / "config.yaml").write_text(yaml.safe_dump(self.config()))
+            (root / "warm-start.json").write_text("{}")
+            (root / "warm-start.safetensors").write_bytes(b"warm")
+            (root / "warm-adapter-config.json").write_text("{}")
+            with (
+                patch(
+                    "gpu_benchmark.run_case", return_value={"end_step": 3000}
+                ) as train,
+                patch("gpu_benchmark.select_refinement_checkpoint") as select,
+                patch("gpu_benchmark.evaluate_pair") as evaluate,
+            ):
+                refinement_experiment(root, work, training_only=True)
+            train.assert_called_once_with(
+                root, work / "refinement", "dual-window", quality=True
+            )
+            select.assert_called_once_with(root, work, self.config())
+            evaluate.assert_not_called()
+            self.assertEqual(
+                json.loads((work / "refinement-training.json").read_text()),
+                {"end_step": 3000},
+            )
+
+    def test_export_rejects_another_task_and_preserves_final_checkpoint(self):
+        from gpu_benchmark import export_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "dual-window"
+            checkpoint = source / "adapter/checkpoints/0000500"
+            checkpoint.mkdir(parents=True)
+            (source / "config.yaml").write_text("model: same\n")
+            (source / "adapter/adapter_config.json").write_text("{}")
+            (source / "adapter/adapters.safetensors").write_bytes(b"final-3000")
+            (checkpoint / "adapters.safetensors").write_bytes(b"selected-500")
+            metadata = {"dataset_sha256": "dataset", "task_sha256": "task"}
+            (checkpoint / "progress.json").write_text(
+                json.dumps({"step": 500, **metadata})
+            )
+            snapshot = {
+                str(path.relative_to(source)): path.read_bytes()
+                for path in source.rglob("*")
+                if path.is_file()
+            }
+            selected = Path(directory) / "selected"
+            export_checkpoint(source, selected, 500, metadata)
+            self.assertEqual(
+                (selected / "adapter/adapters.safetensors").read_bytes(),
+                b"selected-500",
+            )
+            self.assertEqual(
+                {
+                    str(path.relative_to(source)): path.read_bytes()
+                    for path in source.rglob("*")
+                    if path.is_file()
+                },
+                snapshot,
+            )
+            rejected = Path(directory) / "rejected"
+            with self.assertRaisesRegex(ValueError, "differs"):
+                export_checkpoint(
+                    source, rejected, 500, {**metadata, "task_sha256": "another"}
+                )
+            self.assertFalse(rejected.exists())
+
+    def test_selection_exports_the_best_checkpoint_after_full_validation(self):
+        import yaml
+
+        from gpu_benchmark import select_refinement_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            work = Path(directory) / "working"
+            (root / "data").mkdir(parents=True)
+            metadata = {"dataset_sha256": "dataset", "task_sha256": "task"}
+            (root / "data/tokens.json").write_text(json.dumps(metadata))
+            config = self.config()
+            for case in ("baseline", "dual-window"):
+                folder = work / "refinement" / case
+                (folder / "adapter").mkdir(parents=True)
+                (folder / "config.yaml").write_text(yaml.safe_dump(config))
+                (folder / "adapter/adapter_config.json").write_text("{}")
+                (folder / "adapter/adapters.safetensors").write_text(
+                    "baseline" if case == "baseline" else "3000"
+                )
+            final = work / "refinement/dual-window"
+            for step in config["checkpoint_selection_steps"]:
+                checkpoint = final / "adapter/checkpoints" / f"{step:07d}"
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "adapters.safetensors").write_text(str(step))
+                (checkpoint / "progress.json").write_text(
+                    json.dumps({"step": step, **metadata})
+                )
+            snapshot = {
+                str(path.relative_to(final)): path.read_bytes()
+                for path in final.rglob("*")
+                if path.is_file()
+            }
+            force_regression = False
+
+            def score(*args, folders, selection=False):
+                for folder in folders.values():
+                    weight = (folder / "adapter/adapters.safetensors").read_text()
+                    action = {
+                        "name": "no_action",
+                        "arguments": {"reason": "missing_target"},
+                    }
+
+                    def correct(index, model_weight=weight):
+                        if force_regression and not selection:
+                            return model_weight == "baseline"
+                        return model_weight in ("1500", "3000") or (
+                            model_weight == "500" and index % 2 == 0
+                        )
+
+                    command_rows = [
+                        {
+                            "id": identifier,
+                            "command": "Move the missing shape.",
+                            "expected": action,
+                            "correct": correct(index),
+                        }
+                        for index, identifier in enumerate(
+                            config["selection_example_ids"]
+                        )
+                    ]
+                    session_rows = [
+                        {
+                            "id": f"{identifier}:{turn}",
+                            "session_id": identifier,
+                            "turn": turn,
+                            "command": "Move the missing shape.",
+                            "expected": action,
+                            "correct": correct(turn),
+                            "state_matches": correct(turn),
+                            "mutated": False,
+                        }
+                        for identifier in config["selection_session_ids"]
+                        for turn in range(2)
+                    ]
+                    prefix = "selection-" if selection else ""
+                    base = {
+                        "model": "same-model",
+                        "revision": "same-revision",
+                        **metadata,
+                        "split": "valid",
+                        "execution_guards": True,
+                        "adapter_sha256": hashlib.sha256(weight.encode()).hexdigest(),
+                    }
+                    command = {
+                        **base,
+                        "examples": command_rows,
+                        "per_action": {
+                            "no_action": {
+                                "total": len(command_rows),
+                                "correct": sum(row["correct"] for row in command_rows),
+                            }
+                        },
+                    }
+                    session = {**base, "examples": session_rows}
+                    (folder / f"{prefix}valid-guarded.json").write_text(
+                        json.dumps(command)
+                    )
+                    (folder / f"{prefix}sessions-valid-guarded.json").write_text(
+                        json.dumps(session)
+                    )
+
+            with patch("gpu_benchmark.evaluate_pair", side_effect=score) as evaluate:
+                result = select_refinement_checkpoint(root, work, config)
+            self.assertEqual(evaluate.call_count, 3)
+            self.assertEqual(result["chosen_step"], 1500)
+            self.assertTrue(result["promotion_passed"])
+            self.assertFalse(result["test_set_used"])
+            selected = work / "refinement/selected/adapter"
+            self.assertEqual((selected / "adapters.safetensors").read_text(), "1500")
+            self.assertEqual(
+                result["chosen_adapter_sha256"], hashlib.sha256(b"1500").hexdigest()
+            )
+            self.assertTrue((selected / "checkpoints/0001500/progress.json").exists())
+            self.assertEqual(
+                {
+                    str(path.relative_to(final)): path.read_bytes()
+                    for path in final.rglob("*")
+                    if path.is_file()
+                },
+                snapshot,
+            )
+            self.assertEqual(
+                json.loads((work / "checkpoint-selection.json").read_text())[
+                    "chosen_step"
+                ],
+                1500,
+            )
+            force_regression = True
+            rejected = Path(directory) / "rejected"
+            for case in ("baseline", "dual-window"):
+                shutil.copytree(
+                    work / "refinement" / case, rejected / "refinement" / case
+                )
+            with patch("gpu_benchmark.evaluate_pair", side_effect=score):
+                failed = select_refinement_checkpoint(root, rejected, config)
+            self.assertEqual(failed["chosen_step"], 1500)
+            self.assertFalse(failed["promotion_passed"])
+            self.assertIn(
+                "state_agreement_rate", failed["full_validation"]["regressions"]
             )
 
 

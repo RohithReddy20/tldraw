@@ -2,8 +2,76 @@ import argparse
 import hashlib
 import json
 import zipfile
+from collections import Counter
 from itertools import count
 from pathlib import Path
+
+
+def action_stratum(action):
+    arguments = action["arguments"]
+    detail = arguments.get("operation", arguments.get("reason"))
+    return action["name"] + (f":{detail}" if detail is not None else "")
+
+
+def write_training_exposure(path, selected, total, seed, resume_step, updates):
+    source = path.parent.parent / "examples.jsonl"
+    wanted = set(selected)
+    metadata = {}
+    index = 0
+    with source.open() as examples:
+        for line in examples:
+            row = json.loads(line)
+            if row["split"] != "train":
+                continue
+            if index in wanted:
+                metadata[index] = {
+                    key: row[key]
+                    for key in ("id", "expected", "provenance")
+                    if key in row
+                }
+            index += 1
+    if index != total or set(metadata) != wanted:
+        raise ValueError("Training exposure indices do not match the training rows.")
+    identifiers = [metadata[index]["id"] for index in selected]
+    if len({row["id"] for row in metadata.values()}) != len(metadata):
+        raise ValueError("Training exposure requires unique example IDs.")
+    counts = {
+        key: Counter()
+        for key in ("action", "operation", "reason", "provenance", "stratum")
+    }
+    unique_strata = Counter()
+    for index in selected:
+        row = metadata[index]
+        action = row["expected"]
+        arguments = action["arguments"]
+        counts["action"][action["name"]] += 1
+        counts["stratum"][action_stratum(action)] += 1
+        if "operation" in arguments:
+            counts["operation"][f"{action['name']}:{arguments['operation']}"] += 1
+        if "reason" in arguments:
+            counts["reason"][arguments["reason"]] += 1
+        counts["provenance"][row.get("provenance", "unspecified")] += 1
+    for row in metadata.values():
+        unique_strata[action_stratum(row["expected"])] += 1
+    return {
+        "seed": seed,
+        "resume_step": resume_step,
+        "updates": updates,
+        "global_batch": 8,
+        "training_examples": total,
+        "selected_positions": len(selected),
+        "unique_examples": len(wanted),
+        "coverage_fraction": len(wanted) / total,
+        "epoch_equivalents": len(selected) / total,
+        "dropped_length_bucket_examples": total % 8,
+        "selected_indices": selected,
+        "selected_ids": identifiers,
+        **{
+            f"{key}_counts": dict(sorted(value.items()))
+            for key, value in counts.items()
+        },
+        "unique_stratum_counts": dict(sorted(unique_strata.items())),
+    }
 
 
 def completion_loss(model, batch, lengths, window=192):

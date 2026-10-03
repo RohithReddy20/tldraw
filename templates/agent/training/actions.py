@@ -305,11 +305,18 @@ SYSTEM_PROMPT = (
     "Default movement and pan distance is 100 page units; right/down are positive. "
     "Default drawing size is 160 by 100; x/y null places a new shape in the view. "
     "Text height and note dimensions are fitted by the editor. "
+    "Notes cannot be resized; text resizes uniformly. "
+    "Fill is supported only by schemas, geometric shapes, and arrows. "
+    "Frames support opacity only; text and notes support color and opacity. "
+    "Group styles apply recursively to child shapes. "
+    "Requests for unsupported shape capabilities are unsupported_request. "
     "A target name must match exactly one current shape; "
     "duplicate names are ambiguous. "
     "Undo and redo require can_undo and can_redo respectively. "
-    "Questions, explanations, code execution, and requests for multiple edits are "
-    "unsupported_request. For a correction, execute only the final requested edit."
+    "Requests for information, explanations, code execution, or multiple edits are "
+    "unsupported_request. A polite question requesting one supported edit is an "
+    "action request; execute it. For a correction, execute only the final "
+    "requested edit."
 )
 INPUT_FORMAT_VERSION = "general-canvas-three-outcomes-v3"
 
@@ -578,6 +585,8 @@ def execution_guard(command, action, canvas, history):
             re.I,
         ):
             return no_action("unsupported_request")
+    if action["name"] == "no_action":
+        return action
     schemas = {
         item["id"]: item for item in [*canvas["schemas"], *canvas.get("shapes", [])]
     }

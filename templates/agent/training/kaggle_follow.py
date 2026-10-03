@@ -131,6 +131,14 @@ def finish_workflow(kernel, directory, *, training_only=False):
         + r"/(?:adapters\.safetensors|optimizer\.safetensors|"
         r"random\.safetensors|progress\.json)))$"
     )
+    if launch.get("checkpoint_selection_steps"):
+        pattern += (
+            r"|^checkpoint-selection\.json$|^refinement/selected/"
+            r"(?:[^/]+\.(?:json|yaml|log)|adapter/(?:adapters\.safetensors|"
+            r"adapter_config\.json|checkpoints/\d{7}/"
+            r"(?:adapters\.safetensors|progress\.json)))$"
+            r"|^refinement/training-final/training-exposure\.json$"
+        )
     cli(
         "kernels",
         "output",
@@ -152,9 +160,50 @@ def finish_workflow(kernel, directory, *, training_only=False):
         training=result,
         test_set_used=launch.get("test_set_used", False),
     )
+    if launch.get("checkpoint_selection_steps"):
+        selection = json.loads((download / "checkpoint-selection.json").read_text())
+        if (
+            any(
+                selection[key] != launch[key]
+                for key in ("dataset_sha256", "task_sha256")
+            )
+            or selection["test_set_used"]
+        ):
+            raise ValueError(
+                "Checkpoint selection differs from the frozen validation task."
+            )
+        launch.update(
+            checkpoint_selection=selection,
+            promotion_passed=selection["promotion_passed"],
+        )
+        if selection["promotion_passed"]:
+            step = selection["chosen_step"]
+            if step not in launch["checkpoint_selection_steps"]:
+                raise ValueError("Selected checkpoint was not a planned candidate.")
+            launch["selected_step"] = step
+            _, weights = verify_workflow_checkpoint(download, launch)
+            digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+            if digest != selection["chosen_adapter_sha256"]:
+                raise ValueError(
+                    "Selected checkpoint differs from the validated model."
+                )
+            launch.update(downloaded_adapter=str(weights.parent), adapter_sha256=digest)
+        else:
+            weights = download / "refinement/baseline/adapter/adapters.safetensors"
+            digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+            if digest != launch["warm_start_sha256"]:
+                raise ValueError("Retained baseline differs from the warm-start model.")
+            launch.pop("selected_step", None)
+            launch.update(downloaded_adapter=str(weights.parent), adapter_sha256=digest)
+            print(
+                "Validation did not approve a replacement; retained the baseline.",
+                flush=True,
+            )
     (directory / "run.json").write_text(json.dumps(launch, indent=2))
     if training_only:
         print("Recovered and verified the finished training checkpoint.", flush=True)
+        return
+    if launch.get("promotion_passed") is False:
         return
     candidate = weights.parent.parent
     reports = {
@@ -178,7 +227,9 @@ def finish_workflow(kernel, directory, *, training_only=False):
 
 
 def verify_workflow_checkpoint(download, launch):
-    candidate = download / "refinement/dual-window"
+    selected = launch.get("selected_step")
+    candidate = download / "refinement" / ("selected" if selected else "dual-window")
+    checkpoint_step = selected or launch["updates"]
     result = json.loads((download / "refinement-training.json").read_text())
     for key, expected in (
         ("end_step", launch["updates"]),
@@ -189,10 +240,37 @@ def verify_workflow_checkpoint(download, launch):
     ):
         if result[key] != expected:
             raise ValueError(f"Downloaded workflow run differs in {key}.")
+    if total := launch.get("training_examples"):
+        exposure_path = download / "refinement/dual-window/training-exposure.json"
+        if not exposure_path.exists():
+            exposure_path = (
+                download / "refinement/training-final/training-exposure.json"
+            )
+        exposure = json.loads(exposure_path.read_text())
+        if (
+            any(
+                exposure[key] != expected
+                for key, expected in (
+                    ("dataset_sha256", launch["dataset_sha256"]),
+                    ("task_sha256", launch["task_sha256"]),
+                    ("training_batch_sha256", result["training_batch_sha256"]),
+                    ("updates", launch["updates"]),
+                    ("training_examples", total),
+                    ("selected_positions", launch["updates"] * 8),
+                    ("unique_examples", total),
+                    ("coverage_fraction", 1.0),
+                )
+            )
+            or len(exposure["selected_ids"]) != launch["updates"] * 8
+            or len(set(exposure["selected_ids"])) != total
+        ):
+            raise ValueError(
+                "Completed training did not cover the frozen training rows."
+            )
     weights = candidate / "adapter/adapters.safetensors"
-    checkpoint = candidate / "adapter/checkpoints" / f"{launch['updates']:07d}"
+    checkpoint = candidate / "adapter/checkpoints" / f"{checkpoint_step:07d}"
     progress = json.loads((checkpoint / "progress.json").read_text())
-    if progress["step"] != launch["updates"] or any(
+    if progress["step"] != checkpoint_step or any(
         progress[key] != launch[key] for key in ("dataset_sha256", "task_sha256")
     ):
         raise ValueError("Workflow adapter does not match its final checkpoint.")
@@ -221,14 +299,17 @@ def finish_selected_workflow(kernel, directory):
         or not result["test_set_used"]
     ):
         raise ValueError("Final scores do not match the verified adapter.")
-    totals = {
-        "valid": 1200,
-        "valid-guarded": 1200,
-        "sessions-valid": 480,
-        "sessions-valid-guarded": 480,
-        "test-guarded": 2880,
-        "sessions-test-guarded": 1440,
-    }
+    totals = launch.get(
+        "evaluation_counts",
+        {
+            "valid": 1200,
+            "valid-guarded": 1200,
+            "sessions-valid": 480,
+            "sessions-valid-guarded": 480,
+            "test-guarded": 2880,
+            "sessions-test-guarded": 1440,
+        },
+    )
     for name, total in totals.items():
         report = result["reports"][name]
         count = report["turns"] if name.startswith("sessions-") else report["total"]
@@ -247,6 +328,8 @@ def finish_selected_workflow(kernel, directory):
 def launch_final_scoring(directory):
     directory = directory.resolve()
     launch = json.loads((directory / "run.json").read_text())
+    if launch.get("checkpoint_selection_steps") and not launch.get("promotion_passed"):
+        raise ValueError("Final scoring requires a passed validation promotion gate.")
     native = launch.get("native_verification", {})
     if native.get("status") != "passed" or native.get("adapter_sha256") != launch.get(
         "adapter_sha256"
@@ -266,7 +349,16 @@ def launch_final_scoring(directory):
         bundle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
     ) as archive:
         archive.write(source / "refinement-training.json", "refinement-training.json")
-        for case in ("baseline", "dual-window"):
+        if launch.get("training_examples"):
+            path = source / "refinement/dual-window/training-exposure.json"
+            archive.write(path, path.relative_to(source))
+        cases = ["baseline", "dual-window"]
+        if launch.get("selected_step"):
+            cases.append("selected")
+            archive.write(
+                source / "checkpoint-selection.json", "checkpoint-selection.json"
+            )
+        for case in cases:
             for filename in (
                 "config.yaml",
                 "adapter/adapters.safetensors",
@@ -274,21 +366,30 @@ def launch_final_scoring(directory):
             ):
                 path = source / "refinement" / case / filename
                 archive.write(path, path.relative_to(source))
-        for filename in ("adapters.safetensors", "progress.json"):
-            path = (
-                source
-                / "refinement/dual-window/adapter/checkpoints"
-                / f"{launch['updates']:07d}"
-                / filename
-            )
-            archive.write(path, path.relative_to(source))
+        checkpoints = [("dual-window", launch["updates"])]
+        if "selected_step" in launch:
+            checkpoints.append(("selected", launch["selected_step"]))
+        for case, step in checkpoints:
+            for filename in ("adapters.safetensors", "progress.json"):
+                path = (
+                    source
+                    / "refinement"
+                    / case
+                    / "adapter/checkpoints"
+                    / f"{step:07d}"
+                    / filename
+                )
+                archive.write(path, path.relative_to(source))
     digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
-    dataset = "rohithresearch/canvas-270m-v6-final-checkpoint"
-    kernel_id = "rohithresearch/canvas-270m-v6-final-score"
+    scoring = launch.get("final_score_resources", {})
+    dataset = scoring.get("dataset", "rohithresearch/canvas-270m-v6-final-checkpoint")
+    kernel_id = scoring.get("kernel", "rohithresearch/canvas-270m-v6-final-score")
     (inputs / "dataset-metadata.json").write_text(
         json.dumps(
             {
-                "title": "Canvas 270m v6 final checkpoint",
+                "title": scoring.get(
+                    "dataset_title", "Canvas 270m v6 final checkpoint"
+                ),
                 "id": dataset,
                 "licenses": [{"name": "CC0-1.0"}],
             },
@@ -321,7 +422,7 @@ def launch_final_scoring(directory):
     metadata = json.loads((directory / "kernel/kernel-metadata.json").read_text())
     metadata.update(
         id=kernel_id,
-        title="Canvas 270m v6 final score",
+        title=scoring.get("kernel_title", "Canvas 270m v6 final score"),
         dataset_sources=[launch["dataset"], dataset],
     )
     (kernel / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -336,9 +437,18 @@ def launch_final_scoring(directory):
         )
     }
     expected["native_verification"] = "passed"
+    if "selected_step" in launch:
+        expected.update(selected_step=launch["selected_step"], promotion_passed=True)
+    if "training_examples" in launch:
+        expected["training_examples"] = launch["training_examples"]
     sources = {path.name: path.read_text() for path in ROOT.glob("*.py")}
     for name in ("actions.py", "dataset.py", "lab.py", "sessions.py"):
         sources[name] = (Path(launch["frozen_data"]) / name).read_text()
+    if launch.get("checkpoint_selection_steps"):
+        sources = {
+            path.name: path.read_text()
+            for path in Path(launch["frozen_data"]).glob("*.py")
+        }
     code = (
         "TASK = 'score'\nEVALUATION_EXPECTED = "
         + repr(expected)
@@ -416,7 +526,7 @@ def launch_final_scoring(directory):
 
 
 def await_final_scoring(directory):
-    deadline = time.monotonic() + 5 * 60 * 60
+    deadline = time.monotonic() + 8 * 60 * 60
     print("Waiting for completed training and native integration checks.", flush=True)
     while time.monotonic() < deadline:
         try:
@@ -426,6 +536,12 @@ def await_final_scoring(directory):
             continue
         if launch.get("test_set_used") or launch.get("test_set_started"):
             print("Final scoring was already scheduled; see final-score/.", flush=True)
+            return
+        if launch.get("promotion_passed") is False:
+            print(
+                "No checkpoint passed validation; fresh holdout remains untouched.",
+                flush=True,
+            )
             return
         native = launch.get("native_verification", {})
         if native.get("status") == "failed":
@@ -452,12 +568,14 @@ def await_final_scoring(directory):
                 raise
             return
         time.sleep(30)
-    raise TimeoutError("Training and native checks did not finish within five hours.")
+    raise TimeoutError("Training and native checks did not finish within eight hours.")
 
 
 def verify_native(directory):
     directory = directory.resolve()
     launch = json.loads((directory / "run.json").read_text())
+    if launch.get("promotion_passed") is False:
+        raise ValueError("Native promotion checks require a passed validation gate.")
     if launch["status"] not in ("trained", "complete") or not launch.get(
         "adapter_sha256"
     ):
@@ -641,7 +759,9 @@ def main():
                 time.sleep(60)
                 continue
             if args.native_check:
-                verify_native(args.workflow)
+                launch = json.loads((args.workflow / "run.json").read_text())
+                if launch.get("promotion_passed") is not False:
+                    verify_native(args.workflow)
             return
         time.sleep(60)
     raise TimeoutError("Kaggle training exceeded its supervised runtime.")

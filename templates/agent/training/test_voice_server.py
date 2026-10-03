@@ -1,11 +1,16 @@
 import json
+import tempfile
 import threading
 import unittest
 from http.server import HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from actions import execution_guard
+from sessions import CanvasSession, compare_session_state, summarize_sessions
 from voice_server import CommandRequest, handler_for
 
 
@@ -51,6 +56,20 @@ class VoiceGuardTests(unittest.TestCase):
             ),
             {"name": "no_action", "arguments": {"reason": "unsupported_request"}},
         )
+
+    def test_rejected_request_keeps_its_reason_when_history_target_is_absent(self):
+        action = {"name": "no_action", "arguments": {"reason": "unsupported_request"}}
+        for kind in ("created", "edited"):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    execution_guard(
+                        f"Change the last {kind} shape. Then explain why.",
+                        action,
+                        self.canvas,
+                        {f"last_{kind}_id": "removed"},
+                    ),
+                    action,
+                )
 
     def test_selected_target_requires_one_selection_and_named_targets_override_it(self):
         self.canvas["schemas"][1]["name"] = "Account"
@@ -147,6 +166,251 @@ class VoiceGuardTests(unittest.TestCase):
                         },
                     }
                 )
+
+
+class SessionContractTests(unittest.TestCase):
+    def test_group_styles_apply_only_supported_leaf_properties(self):
+        session = CanvasSession(
+            {
+                "schemas": [{"id": "schema", "name": "Schema", "parent_id": "group"}],
+                "shapes": [
+                    {"id": "group", "name": "Group", "kind": "group"},
+                    *[
+                        {"id": kind, "name": kind, "kind": kind, "parent_id": "group"}
+                        for kind in ("text", "note", "frame", "rectangle")
+                    ],
+                ],
+            }
+        )
+        session.execute(
+            "Style the group.",
+            {
+                "name": "style_shapes",
+                "arguments": {
+                    "shape_ids": ["group"],
+                    "color": "blue",
+                    "fill": "pattern",
+                    "opacity": 0.5,
+                },
+            },
+            "unused",
+        )
+        objects = session.objects()
+        self.assertEqual(
+            {key: objects["group"][key] for key in ("color", "fill", "opacity")},
+            {"color": "black", "fill": "none", "opacity": 1.0},
+        )
+        for kind in ("text", "note", "frame", "rectangle", "schema"):
+            with self.subTest(kind=kind):
+                self.assertEqual(objects[kind]["opacity"], 0.5)
+                self.assertEqual(
+                    objects[kind]["color"], "black" if kind == "frame" else "blue"
+                )
+                self.assertEqual(
+                    objects[kind]["fill"],
+                    "pattern" if kind in ("rectangle", "schema") else "none",
+                )
+
+    def test_serialized_context_matches_native_order_and_unnamed_geo_names(self):
+        session = CanvasSession(
+            {
+                "shapes": [
+                    {"id": "z", "name": "Last", "kind": "rectangle", "order": 0},
+                    {"id": "b", "name": "First", "kind": "rectangle", "order": 1},
+                ],
+                "selected_ids": ["z", "b"],
+            }
+        )
+        self.assertEqual(
+            [shape["id"] for shape in session.canvas["shapes"]], ["b", "z"]
+        )
+        self.assertEqual(session.canvas["selected_ids"], ["b", "z"])
+        self.assertEqual([shape["order"] for shape in session.canvas["shapes"]], [1, 0])
+        session.execute(
+            "Create a rectangle.",
+            {"name": "create_shape", "arguments": {"kind": "rectangle"}},
+            "a",
+        )
+        self.assertEqual(session.canvas["shapes"][0]["id"], "a")
+        self.assertEqual(session.objects()["a"]["name"], "geo")
+        session.external([{"kind": "text", "id": "a", "text": "Label"}])
+        session.execute(
+            "Clear its label.",
+            {"name": "set_text", "arguments": {"shape_id": "a", "text": ""}},
+            "unused",
+        )
+        self.assertEqual(session.objects()["a"]["name"], "geo")
+
+    def test_connection_is_visible_deduplicated_and_restored_by_undo(self):
+        session = CanvasSession(
+            {
+                "schemas": [
+                    {"id": "a", "name": "Source"},
+                    {"id": "b", "name": "Destination", "x": 400},
+                ]
+            }
+        )
+        action = {
+            "name": "connect_schemas",
+            "arguments": {"source_id": "a", "target_id": "b", "label": "owns"},
+        }
+        session.execute("Connect Source to Destination.", action, "link")
+        self.assertEqual(session.objects()["link"]["kind"], "arrow")
+        self.assertEqual(session.objects()["link"]["text"], "owns")
+        self.assertEqual(session.history["last_created_id"], None)
+        self.assertEqual(session.history["last_edited_id"], "a")
+        connected = session.snapshot()
+        session.execute("Connect Source to Destination.", action, "unused")
+        self.assertEqual(session.snapshot(), connected)
+        session.execute(
+            "Delete the arrow.",
+            {"name": "delete_shapes", "arguments": {"shape_ids": ["link"]}},
+            "unused",
+        )
+        self.assertNotIn("link", session.objects())
+        self.assertEqual(session.connections, [])
+        session.execute(
+            "Undo.",
+            {"name": "canvas_command", "arguments": {"operation": "undo"}},
+            "unused",
+        )
+        self.assertIn("link", session.objects())
+        self.assertEqual(session.connections, connected["connections"])
+        session.external([{"kind": "delete", "id": "a"}])
+        self.assertIn("link", session.objects())
+        self.assertEqual(session.connections, [])
+
+    def test_component_metrics_distinguish_viewport_from_document_errors(self):
+        session = CanvasSession(
+            {"shapes": [{"id": "a", "name": "A", "kind": "rectangle"}]}
+        )
+        expected = session.snapshot()
+        session.execute(
+            "Pan right.",
+            {"name": "pan_canvas", "arguments": {"dx": 100, "dy": 0}},
+            "unused",
+        )
+        components = compare_session_state(session.snapshot(), expected)
+        self.assertEqual(
+            components,
+            {
+                "state_matches": False,
+                "document_matches": True,
+                "selection_matches": True,
+                "camera_matches": False,
+            },
+        )
+        row = {
+            "session_id": "session",
+            "turn": 0,
+            "correct": False,
+            "mutated": True,
+            "expected": {"name": "pan_canvas"},
+            **components,
+        }
+        report = summarize_sessions([row])
+        self.assertEqual(report["state_agreement_rate"], 0)
+        self.assertEqual(report["document_agreement_rate"], 1)
+        self.assertEqual(report["selection_agreement_rate"], 1)
+        self.assertEqual(report["camera_agreement_rate"], 0)
+        legacy = {
+            key: value
+            for key, value in row.items()
+            if key not in components or key == "state_matches"
+        }
+        self.assertEqual(summarize_sessions([legacy])["document_agreement_rate"], None)
+
+
+class EvaluationSelectionTests(unittest.TestCase):
+    def test_id_selection_keeps_dataset_order_and_rejects_invalid_ids(self):
+        from lab import filter_examples
+
+        examples = [{"id": identifier} for identifier in ("third", "first", "second")]
+        self.assertIs(filter_examples(examples, None), examples)
+        self.assertEqual(
+            filter_examples(examples, ["second", "third"]),
+            [{"id": "third"}, {"id": "second"}],
+        )
+        for requested in ([], "third", [None], ["third", "third"], ["missing"]):
+            with self.subTest(requested=requested), self.assertRaises(ValueError):
+                filter_examples(examples, requested)
+
+    def test_filtered_evaluation_rejects_wrong_split_before_loading_model(self):
+        from lab import evaluate, evaluate_sessions
+
+        args = SimpleNamespace(
+            adapter=None,
+            split="valid",
+            limit=None,
+            example_ids=["other-split"],
+            session_ids=["other-split"],
+        )
+        with (
+            patch("lab.prepare_data"),
+            patch(
+                "lab.read_examples",
+                return_value=[{"id": "other-split", "split": "train"}],
+            ),
+            patch("lab.load_model") as load,
+        ):
+            for evaluate_fn in (evaluate, evaluate_sessions):
+                with (
+                    self.subTest(evaluate_fn=evaluate_fn),
+                    self.assertRaises(ValueError),
+                ):
+                    evaluate_fn(args)
+            load.assert_not_called()
+
+    def test_session_subset_reports_camera_divergence(self):
+        from lab import evaluate_sessions
+
+        case = {
+            "id": "selected",
+            "split": "valid",
+            "initial_canvas": {},
+            "turns": [
+                {
+                    "id": "selected:0",
+                    "before": [],
+                    "command": "Pan right.",
+                    "expected": {
+                        "name": "pan_canvas",
+                        "arguments": {"dx": 100, "dy": 0},
+                    },
+                }
+            ],
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("lab.read_examples", return_value=[{**case, "id": "excluded"}, case]),
+            patch("lab.load_model", return_value=(object(), object())),
+            patch("lab._metadata", return_value={}),
+            patch(
+                "lab.predict",
+                return_value={
+                    "prediction": {
+                        "name": "canvas_command",
+                        "arguments": {"operation": "zoom_to_fit"},
+                    }
+                },
+            ) as predict,
+        ):
+            args = SimpleNamespace(
+                adapter=None,
+                split="valid",
+                limit=None,
+                session_ids=["selected"],
+                output=Path(directory) / "report.json",
+            )
+            evaluate_sessions(args)
+            report = json.loads(args.output.read_text())
+            self.assertEqual(predict.call_count, 1)
+            self.assertEqual([row["id"] for row in report["examples"]], ["selected:0"])
+            self.assertEqual(report["turns"], 1)
+            self.assertEqual(report["state_agreement_rate"], 0)
+            self.assertEqual(report["document_agreement_rate"], 1)
+            self.assertEqual(report["camera_agreement_rate"], 0)
+            self.assertEqual(report["simulator_version"], "native-visible-shapes-v2")
 
 
 class VoiceHttpTests(unittest.TestCase):
