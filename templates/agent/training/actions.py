@@ -583,8 +583,10 @@ def execution_guard(command, action, canvas, history):
             re.I,
         )
     )
+    antecedent_command, antecedent_syntax = "", ""
     if corrections:
         start = corrections[-1].end()
+        antecedent_command, antecedent_syntax = command[:start], syntax[:start]
         command, syntax = command[start:], syntax[start:]
         if not command.strip():
             return no_action("unsupported_request")
@@ -610,48 +612,188 @@ def execution_guard(command, action, canvas, history):
     schemas = {
         item["id"]: item for item in [*canvas["schemas"], *canvas.get("shapes", [])]
     }
-    if (
-        re.search(
-            r"\b(?:to|from|on|in|of|rename|call|update)\s+(?:the\s+)?"
-            r"selected (?:box|schema|class|shape|rectangle|circle|text|note)\b",
-            syntax,
-            re.I,
-        )
-        and len(canvas.get("selected_ids", [])) != 1
-    ):
-        return no_action("ambiguous_target" if schemas else "missing_target")
+    arguments = action["arguments"]
+    targets = [
+        arguments[key]
+        for key in ("schema_id", "source_id", "target_id", "shape_id")
+        if key in arguments
+    ] + arguments.get("shape_ids", [])
+    shape_edit = action["name"] not in (
+        "create_schema_box",
+        "create_shape",
+        "canvas_command",
+        "pan_canvas",
+    )
+    if not shape_edit:
+        return action
+    reference_syntax = syntax
+    reference_ids = set()
     for kind, expression in (
         (
             "created",
-            r"\b(?:last created|(?:schema|class|box) we (?:last |just )?created)\b",
+            r"\b(?:(?:the|this|that)\s+)?(?:last (?:created|added|drawn)"
+            r"(?: (?:box|schema|class|shape|object|rectangle|circle|note|frame))?|"
+            r"(?:schema|class|box|shape|object|rectangle|"
+            r"circle|note|frame) (?:we|you) (?:(?:last|just) )?"
+            r"(?:created|added|drew|made))\b",
         ),
-        ("edited", r"\b(?:last edited|(?:schema|class|box) we (?:last )?edited)\b"),
+        (
+            "edited",
+            r"\b(?:(?:the|this|that)\s+)?(?:last (?:edited|changed|modified)"
+            r"(?: (?:box|schema|class|shape|object))?|"
+            r"(?:schema|class|box|shape|object) "
+            r"(?:we|you) (?:(?:last|just) )?(?:edited|changed|modified))\b",
+        ),
     ):
-        if (
-            re.search(expression, syntax, re.I)
-            and history.get(f"last_{kind}_id") not in schemas
-        ):
-            return no_action("missing_target")
-    if action["name"] != "create_schema_box":
-        arguments = action["arguments"]
-        targets = [
-            arguments.get(key)
-            for key in ("schema_id", "source_id", "target_id", "shape_id")
+        if re.search(expression, syntax, re.I):
+            identifier = history.get(f"last_{kind}_id")
+            if identifier not in schemas:
+                return no_action("missing_target")
+            reference_ids.add(identifier)
+            reference_syntax = re.sub(
+                expression,
+                lambda match: " " * len(match.group()),
+                reference_syntax,
+                flags=re.I,
+            )
+    if "schema_id" in arguments and action["name"] != "rename_schema":
+        named_prefix = (
+            r"to|from|on|in|of|for|within|(?:schema|class|box)(?:\s+(?:named|called))?"
+        )
+    elif action["name"] == "set_text":
+        named_prefix = r"of|on|in|for|give|named|called"
+    elif action["name"] == "rename_schema":
+        named_prefix = r"rename|call|named|called"
+    else:
+        named_prefix = (
+            r"move|shift|nudge|drag|delete|remove|erase|select|deselect|duplicate|"
+            r"copy|rotate|turn|flip|style|color|colour|make|resize|scale|reposition|bring|"
+            r"send|put|connect|link|join|to|from|on|in|of|with|and|need|want|named|called"
+        )
+    named_ids = set()
+    antecedent_ids = set()
+    qualified_named = False
+
+    def visible_target(match, content, masked, target_name):
+        if not masked[match.start("prefix") : match.end("prefix")].strip():
+            return False
+        return (
+            target_name.casefold() not in ("it", "this", "that")
+            or content[match.end("prefix")] in "\"'“"
+            or re.search(r"\b(?:named|called)\b", match["prefix"], re.I)
+        )
+
+    for item in schemas.values():
+        name = item["name"]
+        named_target = (
+            rf"(?P<prefix>\b(?:{named_prefix})\s+(?:the\s+)?"
+            r"(?:(?:schema|box|class|shape|object|frame|group)\s+)?)"
+            rf"[\"'“]?{re.escape(name)}(?!\w)[\"'”]?"
+        )
+
+        matches = [
+            match
+            for match in re.finditer(named_target, command, re.I)
+            if visible_target(match, command, syntax, name)
         ]
-        targets.extend(arguments.get("shape_ids", []))
-        for target_id in targets:
-            target = schemas.get(target_id)
-            if target is None:
-                continue
-            name = target["name"]
+        if any(
+            visible_target(match, antecedent_command, antecedent_syntax, name)
+            for match in re.finditer(named_target, antecedent_command, re.I)
+        ):
+            antecedent_ids.add(item["id"])
+        possessive = re.search(
+            rf"(?<!\w){re.escape(name)}(?:['’]s|\s+(?:schema|box|class)\b)",
+            syntax,
+            re.I,
+        )
+        if matches or possessive:
             duplicates = sum(
-                item["name"].casefold() == name.casefold() for item in schemas.values()
+                other["name"].casefold() == name.casefold()
+                for other in schemas.values()
             )
-            named = re.search(
-                rf"\b(?:to|from|on|in|of|named|called|rename|connect)\s+(?:the\s+)?(?:(?:schema|box|class)\s+)?{re.escape(name)}(?!\w)|(?<!\w){re.escape(name)}(?:['’]s|\s+(?:schema|box|class)\b)",
-                command,
-                re.I,
-            )
-            if duplicates > 1 and named:
+            if shape_edit and duplicates > 1:
                 return no_action("ambiguous_target")
+            named_ids.add(item["id"])
+        named_shape = (
+            r"\b(?:(?:the|this|that)\s+)?(?:(?:selected|chosen|highlighted)\s+)?"
+            r"(?:box|schema|class|shape|object|rectangle|circle|text|note|frame|group) "
+            rf"(?:named|called)\s+[\"'“]?{re.escape(name)}(?!\w)[\"'”]?"
+        )
+        for match in re.finditer(named_shape, command, re.I):
+            qualifier = re.search(r"\b(?:named|called)\b", match.group(), re.I)
+            if not syntax[match.start() : match.start() + qualifier.end()].strip():
+                continue
+            if item["id"] not in named_ids:
+                continue
+            qualified_named = True
+            reference_syntax = (
+                reference_syntax[: match.start()]
+                + " " * len(match.group())
+                + reference_syntax[match.end() :]
+            )
+    reference_ids.update(named_ids)
+    reference_syntax = re.sub(
+        r"\b(?:every|each)\s+(?:selected|chosen|highlighted)\s+"
+        r"(?:box|schema|class|shape|object|rectangle|circle|text|note|frame|group)\b",
+        lambda match: " " * len(match.group()),
+        reference_syntax,
+        flags=re.I,
+    )
+    singular_selection = re.search(
+        r"\b(?:selected|chosen|highlighted)\s+"
+        r"(?:box|schema|class|shape|object|rectangle|circle|text|note|frame|group)\b",
+        reference_syntax,
+        re.I,
+    )
+    pronoun_syntax = re.sub(
+        r"\ball of (?:it|this|that)\b",
+        lambda match: " " * len(match.group()),
+        reference_syntax,
+        flags=re.I,
+    )
+    singular_pronoun = re.search(
+        r"\b(?:"
+        r"(?:move|shift|nudge|drag|delete|remove|erase|rename|call|update|change|edit|resize|"
+        r"select|deselect|duplicate|copy|rotate|turn|flip|style|color|colour|make|"
+        r"set|bring|send|put|connect|link|to|from|on|in|of|with)\s+(?:just\s+)?"
+        r"(?:it|this|that)\b(?!\s+(?:selection|collection|set|pair|"
+        r"last|previous|earlier)\b)|"
+        r"(?:get\s+rid\s+of|give)\s+(?:it|this|that)\b|"
+        r"(?:this|that)\s+(?:box|schema|class|shape|object|rectangle|circle|"
+        r"text|note|frame|group|one)\b|"
+        r"its\s+(?:name|text|label|color|colour|fill|opacity|width|height|size)\b|"
+        r"(?:it|this|that)\s+(?:should|could|needs?\s+to|ought\s+to)\s+be\b)",
+        pronoun_syntax,
+        re.I,
+    )
+    separate_pronoun = re.search(
+        r"\b(?:it|this|that)\s+and\b|\band\s+(?:it|this|that)\b",
+        pronoun_syntax,
+        re.I,
+    )
+    if singular_pronoun and not reference_ids and antecedent_ids:
+        if len(antecedent_ids) != 1:
+            return no_action("ambiguous_target")
+        reference_ids.update(antecedent_ids)
+    needs_selection = (
+        singular_selection
+        or singular_pronoun
+        and (
+            not reference_ids or separate_pronoun or action["name"] == "connect_schemas"
+        )
+    )
+    if shape_edit and needs_selection:
+        selection = canvas.get("selected_ids", [])
+        if len(selection) != 1:
+            return no_action("ambiguous_target" if schemas else "missing_target")
+        reference_ids.update(selection)
+    # Named and history references may coexist with a singular selected target.
+    enforce_targets = (
+        singular_selection
+        or singular_pronoun
+        or qualified_named
+        or (reference_ids - named_ids)
+    )
+    if enforce_targets and reference_ids and set(targets) != reference_ids:
+        return no_action("ambiguous_target")
     return action

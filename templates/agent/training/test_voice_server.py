@@ -186,6 +186,303 @@ class VoiceGuardTests(unittest.TestCase):
             {"name": "no_action", "arguments": {"reason": "missing_target"}},
         )
 
+    def test_singular_conversational_targets_cannot_edit_multiple_selections(self):
+        action = {
+            "name": "delete_shapes",
+            "arguments": {"shape_ids": ["first", "second"]},
+        }
+        for command in (
+            "Get rid of the chosen shape, please.",
+            "Could you move it a little to the left?",
+            "Make this blue.",
+            "Can you give that a blue outline?",
+            "Change its name to Gamma.",
+            "This should be blue.",
+            "Make the selected group blue.",
+        ):
+            for selection in ([], ["first", "second"]):
+                with self.subTest(command=command, selection=selection):
+                    self.assertEqual(
+                        execution_guard(
+                            command,
+                            action,
+                            {**self.canvas, "selected_ids": selection},
+                            {},
+                        ),
+                        {
+                            "name": "no_action",
+                            "arguments": {"reason": "ambiguous_target"},
+                        },
+                    )
+        self.assertEqual(
+            execution_guard("Move it left.", action, {"schemas": []}, {}),
+            {"name": "no_action", "arguments": {"reason": "missing_target"}},
+        )
+
+    def test_singular_reference_requires_the_actual_selected_target(self):
+        for ids in (["second"], ["first", "second"]):
+            with self.subTest(ids=ids):
+                self.assertEqual(
+                    execution_guard(
+                        "Move it left.",
+                        {
+                            "name": "move_shapes",
+                            "arguments": {"shape_ids": ids, "dx": -25, "dy": 0},
+                        },
+                        self.canvas,
+                        {},
+                    ),
+                    {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+                )
+        action = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first"], "dx": -25, "dy": 0},
+        }
+        self.assertEqual(
+            execution_guard("Move it left.", action, self.canvas, {}), action
+        )
+
+    def test_history_and_explicit_names_override_multiple_selection(self):
+        canvas = {
+            **self.canvas,
+            "schemas": [
+                {"id": "first", "name": "Alpha"},
+                {"id": "second", "name": "Beta"},
+            ],
+            "selected_ids": ["first", "second"],
+        }
+        action = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first"], "dx": 25, "dy": 0},
+        }
+        for command in (
+            "Move that box we just created right.",
+            "Move the shape you added right.",
+            "Move that last created frame right.",
+            "Move the last edited shape right.",
+            'Move this shape named "Alpha" right.',
+            "Move the selected shape named Alpha right.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    execution_guard(
+                        command,
+                        action,
+                        canvas,
+                        {"last_created_id": "first", "last_edited_id": "first"},
+                    ),
+                    action,
+                )
+        for command in (
+            "Move the shape you added right.",
+            "Move that box we just created right.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    execution_guard(
+                        command, action, canvas, {"last_created_id": "deleted"}
+                    ),
+                    {"name": "no_action", "arguments": {"reason": "missing_target"}},
+                )
+
+    def test_plural_and_canvas_requests_do_not_require_a_single_selection(self):
+        canvas = {**self.canvas, "selected_ids": ["first", "second"]}
+        action = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first", "second"], "dx": -25, "dy": 0},
+        }
+        for command in (
+            "Move both selected shapes left.",
+            "Move them left.",
+            "Move all of it left.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(execution_guard(command, action, canvas, {}), action)
+        for command, operation in (("Undo that.", "undo"), ("Redo it.", "redo")):
+            action = {"name": "canvas_command", "arguments": {"operation": operation}}
+            with self.subTest(command=command):
+                self.assertEqual(execution_guard(command, action, canvas, {}), action)
+        action = {"name": "pan_canvas", "arguments": {"dx": -100, "dy": 0}}
+        self.assertEqual(
+            execution_guard("Pan this view left.", action, canvas, {}), action
+        )
+
+    def test_literal_pronouns_and_named_connection_source_do_not_override_selection(
+        self,
+    ):
+        canvas = {
+            **self.canvas,
+            "schemas": [
+                {"id": "first", "name": "Alpha"},
+                {"id": "second", "name": "it"},
+            ],
+            "selected_ids": [],
+        }
+        action = {"name": "delete_shapes", "arguments": {"shape_ids": ["second"]}}
+        self.assertEqual(
+            execution_guard('Delete the shape named "it".', action, canvas, {}), action
+        )
+        self.assertEqual(
+            execution_guard("Delete it.", action, canvas, {}),
+            {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+        )
+        action = {
+            "name": "connect_schemas",
+            "arguments": {"source_id": "first", "target_id": "second", "label": ""},
+        }
+        self.assertEqual(
+            execution_guard('Connect "Alpha" to it.', action, canvas, {}),
+            {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+        )
+
+    def test_named_antecedents_include_fields_and_cancelled_directions(self):
+        canvas = {
+            "schemas": [
+                {"id": "schema", "name": "Reading list", "properties": ["subjects"]}
+            ],
+            "shapes": [
+                {"id": "first", "name": "Route marker", "kind": "rectangle"},
+                {"id": "second", "name": "Other", "kind": "rectangle"},
+            ],
+            "selected_ids": ["second"],
+        }
+        remove = {
+            "name": "remove_property",
+            "arguments": {"schema_id": "schema", "property_name": "subjects"},
+        }
+        for command in (
+            'We do not need the "subjects" attribute in "Reading list"; '
+            "could you remove it?",
+            'The schema "Reading list" should stop listing "subjects" as a member; '
+            "please delete that attribute.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(execution_guard(command, remove, canvas, {}), remove)
+        add = {
+            "name": "add_property",
+            "arguments": {"schema_id": "schema", "property_name": "Route marker"},
+        }
+        self.assertEqual(
+            execution_guard(
+                'I need "Route marker" listed in "Reading list"; '
+                "put that attribute in.",
+                add,
+                canvas,
+                {},
+            ),
+            add,
+        )
+        move = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first"], "dx": 60, "dy": 0},
+        }
+        for command in (
+            'I need "Route marker" 60 page units farther east; please shift it there.',
+            'Shift "Route marker" left 100; actually, cancel that '
+            "and move it right 60.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(execution_guard(command, move, canvas, {}), move)
+
+    def test_multiple_explicit_references_and_plural_quantifiers_are_preserved(self):
+        canvas = {
+            **self.canvas,
+            "schemas": [
+                {"id": "first", "name": "Alpha"},
+                {"id": "second", "name": "Beta"},
+            ],
+        }
+        move = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first", "second"], "dx": 80, "dy": 0},
+        }
+        for command in (
+            "Move the chosen shape and Beta right 80.",
+            "Move the last created shape and the last edited shape right 80.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    execution_guard(
+                        command,
+                        move,
+                        canvas,
+                        {"last_created_id": "first", "last_edited_id": "second"},
+                    ),
+                    move,
+                )
+        canvas["selected_ids"] = ["first", "second"]
+        for command in (
+            "Would you move every selected object 80 page units to the right?",
+            "Please nudge every highlighted object to the right by 80 page units.",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(execution_guard(command, move, canvas, {}), move)
+        select = {
+            "name": "select_shapes",
+            "arguments": {"shape_ids": ["first", "second"]},
+        }
+        self.assertEqual(
+            execution_guard('Pick "Alpha" and "Beta".', select, canvas, {}), select
+        )
+
+    def test_qualified_names_cannot_redirect_an_edit_or_escape_duplicate_checks(self):
+        canvas = {
+            **self.canvas,
+            "schemas": [
+                {"id": "first", "name": "Alpha"},
+                {"id": "second", "name": "Beta"},
+            ],
+        }
+        wrong = {"name": "delete_shapes", "arguments": {"shape_ids": ["second"]}}
+        self.assertEqual(
+            execution_guard(
+                'Delete the selected shape named "Alpha".', wrong, canvas, {}
+            ),
+            {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+        )
+        canvas["schemas"][1]["name"] = "Alpha"
+        for command in ('Delete "Alpha".', 'Delete the shape named "Alpha".'):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    execution_guard(command, wrong, canvas, {}),
+                    {"name": "no_action", "arguments": {"reason": "ambiguous_target"}},
+                )
+        caption = {
+            "name": "set_text",
+            "arguments": {
+                "shape_id": "second",
+                "text": "the selected shape named Alpha",
+            },
+        }
+        canvas["schemas"][1]["name"] = "Beta"
+        canvas["selected_ids"] = []
+        self.assertEqual(
+            execution_guard(
+                'Set the text of "Beta" to "the selected shape named Alpha".',
+                caption,
+                canvas,
+                {},
+            ),
+            caption,
+        )
+
+    def test_canvas_history_can_recover_a_shape_that_is_currently_absent(self):
+        for command, operation in (
+            ("Undo the deletion of the last created shape.", "undo"),
+            ("Redo the change to the last edited shape.", "redo"),
+        ):
+            action = {"name": "canvas_command", "arguments": {"operation": operation}}
+            with self.subTest(command=command):
+                self.assertEqual(
+                    execution_guard(
+                        command,
+                        action,
+                        {"schemas": []},
+                        {"last_created_id": "deleted", "last_edited_id": "deleted"},
+                    ),
+                    action,
+                )
+
     def test_method_lists_are_not_mistaken_for_a_second_edit(self):
         create = {
             "name": "create_schema_box",
