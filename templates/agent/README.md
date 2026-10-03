@@ -743,6 +743,67 @@ mask, while the block-diagonal causal local mask is listed as supported. The
 experimental runner checks the materialized mask, including separation between
 examples, before measuring that representation.
 
+#### Bounded Modal H100 measurement
+
+`training/modal_benchmark.py` runs one H100 worker with the frozen version-seven
+training contract and retained version-six warm start. It samples 64 training
+examples across eight length quantiles, including the longest batch. Development
+and test examples are excluded. Each successful stage measures 40 optimizer
+updates after eight warmup updates with effective batch eight.
+
+The first stage uses micro batch two, accumulation four, and checkpointing of all
+layers. A second stage can use micro batch eight without checkpointing and gather
+only actual completion positions. It runs only if the first stage is finite,
+uses less than a quarter of GPU memory, and leaves sufficient time. Median and
+longest batches must pass initial loss and all-trainable-gradient comparisons
+before the second stage trains. Neither stage promotes an adapter or measures
+action accuracy.
+
+The preparation command requires the ignored frozen source and token cache under
+`training/runs/v7-accuracy-workflow-revised/`, the converted FP16 base under
+`training/runs/base-bb327a9a-float16/`, and the verified version-six adapter under
+`training/runs/kaggle/spoken/download/refinement/dual-window/adapter/`. It verifies
+their checksums before building the payload. The cloud image downloads the pinned
+public BF16 base on CPU and reproduces the local FP16 file exactly; CUDA headers
+are provided by the NVIDIA development image.
+
+Run from the monorepo root after reviewing the resource limits and current
+[Modal prices](https://modal.com/pricing):
+
+```sh
+uv tool install modal==1.6.0
+modal setup
+uv run --project templates/agent/training python templates/agent/training/prepare_modal_benchmark.py
+uv run --no-project --isolated --with modal==1.6.0 python templates/agent/training/modal_benchmark.py
+```
+
+Modal requires a payment method. The runner permits one container and one
+function call, disables application retries, bounds image setup to 300 seconds,
+and stops its specific ephemeral app after completion or a 690-second active
+deadline. These deadlines and resource estimates are not an account spending
+cap; check usage before another run. The original benchmark allowance was $2
+across setup attempts and the measurement. Local reports, telemetry, launch and
+stop receipts are saved under `training/runs/quality-next/modal/`.
+
+The October 3 measurement completed 48 updates with finite losses and adapter
+weights. Its steady median was 1.477 updates/second, or 11.82 examples/second;
+elapsed steady throughput was 1.438 updates/second. Average sampled GPU activity
+was 55.19%, peak sampled VRAM was 9,411 MiB, and mean power was 351.02 W across
+26 steady samples. This does not establish peak GPU utilization. The median rate
+was 4.54 times the recent version-seven dual-T4 rate, but the short quantile
+workload differs from the full training corpus and does not guarantee that
+speedup for a complete run.
+
+The second stage failed its first numerical comparison: initial loss differed by
+0.0002383 and gradient relative L2 by 7.28%, above the 1e-5 and 1% limits. It
+performed no optimizer updates. The existing trainer remains the retained
+configuration; that numerical failure does not measure task accuracy. GPU
+function time was 217.74 seconds, with a requested-resource cost estimate of
+$0.258 excluding image setup and idle time. Modal reported about $0.39 of
+cumulative credit consumption and no cash charges immediately after stopping all
+benchmark apps; billing records can lag. The improved quality supplement remains
+untrained.
+
 #### Accuracy trial for the faster trainer
 
 Notebook version 6 resumed the same retained update-5,000 adapter and optimizer
