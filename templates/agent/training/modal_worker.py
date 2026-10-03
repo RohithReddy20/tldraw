@@ -16,11 +16,19 @@ WARMUP = 8
 BASELINE_RATE = 0.3254031406462446
 
 
+def candidate_gate_status(gates, *, training_profile=False):
+    if len(gates) != 2 or not all(gate["finite"] for gate in gates):
+        return "non_finite_gate" if training_profile else "gradient_gate_failed"
+    if not training_profile and not all(gate["passed"] for gate in gates):
+        return "gradient_gate_failed"
+    return None
+
+
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def run(stage):
+def run(stage, *, training_profile=False):
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -67,11 +75,13 @@ def run(stage):
         config["batch_size"] != 8
         or config["lora_parameters"]["rank"] != 32
         or config["loss_mode"] != "completion_tokens_v1"
+        or config["completion_window"] != 160
     ):
         raise ValueError("Frozen training contract changed.")
     micro = 2 if stage == "safe" else 8
     accumulation = 8 // micro
-    packed = stage == "candidate"
+    packed = stage == "candidate" and not training_profile
+    checkpoint = "all" if stage == "safe" else "none"
     output = Path("/results") / stage
     output.mkdir(parents=True, exist_ok=True)
     model, _ = load(str(ROOT / "model"))
@@ -80,7 +90,7 @@ def run(stage):
     model.load_weights(str(ROOT / "warm-start.safetensors"), strict=False)
     np.random.seed(config["seed"])
     mx.random.seed(config["seed"])
-    if not packed:
+    if checkpoint == "all":
         checkpoint_layers(model, "all")
     with np.load(ROOT / "representative.npz") as archive:
         raw = [(archive[f"batch_{i}"], archive[f"bounds_{i}"]) for i in range(8)]
@@ -179,17 +189,30 @@ def run(stage):
                 and gate["loss_absolute_error"] < 1e-5
                 and gate["gradient_relative_l2_error"] < 0.01
             )
-            if not gate["passed"]:
-                result = {
-                    "stage": stage,
-                    "status": "gradient_gate_failed",
-                    "gates": gates + [gate],
-                    "trained_updates": 0,
-                }
-                (output / "result.json").write_text(json.dumps(result, indent=2))
-                print(json.dumps(result), flush=True)
-                return
         gates.append(gate)
+    equivalent = stage == "safe" or all(gate["passed"] for gate in gates)
+    measurement_scope = (
+        "throughput_only" if training_profile else "equivalence_benchmark"
+    )
+    status = (
+        candidate_gate_status(gates, training_profile=training_profile)
+        if stage == "candidate"
+        else None
+    )
+    if status is not None:
+        result = {
+            "stage": stage,
+            "status": status,
+            "training_profile": training_profile,
+            "measurement_scope": measurement_scope,
+            "equivalence_gate_passed": equivalent,
+            "gates": gates,
+            "trained_updates": 0,
+            "accuracy_or_promotion_evaluation": False,
+        }
+        (output / "result.json").write_text(json.dumps(result, indent=2))
+        print(json.dumps(result), flush=True)
+        return
     del grads, flat, current, value_and_grad
     mx.clear_cache()
     mx.reset_peak_memory()
@@ -255,15 +278,20 @@ def run(stage):
     result = {
         "stage": stage,
         "status": "completed" if finite else "non_finite_weights",
+        "training_profile": training_profile,
+        "measurement_scope": measurement_scope,
+        "equivalence_gate_passed": equivalent,
+        "accuracy_or_promotion_evaluation": False,
         "global_batch": 8,
         "micro_batch": micro,
         "accumulation": accumulation,
         "workers": 1,
-        "checkpoint": "none" if packed else "all",
+        "checkpoint": checkpoint,
         "head": "packed_exact_completion" if packed else "window_160",
         "model_dtype": "float16",
         "gates": gates,
         "updates": UPDATES,
+        "trained_updates": UPDATES,
         "warmup_updates": WARMUP,
         "steady_updates": UPDATES - WARMUP,
         "updates_per_second_median": rate,
@@ -294,6 +322,12 @@ def run(stage):
         "task_sha256": manifest["task_sha256"],
         "reports": reports,
         "comparison_limit": (
+            "Throughput-only profile; a failed numerical-equivalence gate does "
+            "not establish equivalent training, accuracy, or promotion safety. "
+            if training_profile and not equivalent
+            else ""
+        )
+        + (
             "Representative quantile batches and short warmup differ from full "
             "v7 epoch; speedup is a probe, not a guaranteed full-run speedup "
             "or accuracy result."
@@ -306,4 +340,6 @@ def run(stage):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", choices=("safe", "candidate"), required=True)
-    run(parser.parse_args().stage)
+    parser.add_argument("--training-profile", action="store_true")
+    args = parser.parse_args()
+    run(args.stage, training_profile=args.training_profile)

@@ -13,10 +13,13 @@ from pathlib import Path
 import modal
 
 TRAINING = Path(__file__).resolve().parent
-HERE = TRAINING / "runs/quality-next/modal"
-PAYLOAD = HERE / "payload"
+BENCHMARK_DIR = TRAINING / "runs/quality-next/modal"
+PROFILE_DIR = TRAINING / "runs/v8-quality-modal/profile"
+TRAINING_PROFILE = "--training-profile" in sys.argv
+HERE = PROFILE_DIR if TRAINING_PROFILE else BENCHMARK_DIR
+PAYLOAD = BENCHMARK_DIR / "payload"
 BASE = TRAINING / "runs/base-bb327a9a-float16"
-BASE_REPRO = HERE / "base-repro"
+BASE_REPRO = BENCHMARK_DIR / "base-repro"
 BUILD_SECONDS = 300
 ACTIVE_SECONDS = 690
 STOP_SECONDS = 15
@@ -175,7 +178,7 @@ image = (
     scaledown_window=2,
     serialized=True,
 )
-def benchmark(deadline_unix: float):
+def benchmark(deadline_unix: float, training_profile: bool = False):
     if time.time() >= deadline_unix - 15:
         return {"status": "absolute_deadline_expired", "stages": {}}
     results = Path("/results")
@@ -229,6 +232,10 @@ def benchmark(deadline_unix: float):
     started = time.monotonic()
     report = {
         "gpu": "H100!",
+        "training_profile": training_profile,
+        "measurement_scope": (
+            "throughput_only" if training_profile else "equivalence_benchmark"
+        ),
         "modal_timeout_seconds": 720,
         "internal_timeout_seconds": 600,
         "retries": 0,
@@ -244,13 +251,19 @@ def benchmark(deadline_unix: float):
         return min(600 - (time.monotonic() - started), deadline_unix - time.time() - 15)
 
     def stage(name, timeout):
+        stage_started = time.monotonic()
         timeout = min(timeout, remaining_seconds())
         if timeout <= 0:
             return {"stage": name, "status": "absolute_deadline_expired"}
         with (results / f"{name}.log").open("w") as log:
             try:
+                arguments = [
+                    sys.executable, "-u", "/benchmark-worker.py", "--stage", name
+                ]
+                if training_profile:
+                    arguments.append("--training-profile")
                 completed = subprocess.run(
-                    [sys.executable, "-u", "/benchmark-worker.py", "--stage", name],
+                    arguments,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     env=environment,
@@ -259,7 +272,22 @@ def benchmark(deadline_unix: float):
                 )
                 path = results / name / "result.json"
                 if completed.returncode == 0 and path.exists():
-                    return json.loads(path.read_text())
+                    result = json.loads(path.read_text())
+                    stage_seconds = time.monotonic() - stage_started
+                    result["stage_seconds"] = stage_seconds
+                    result["requested_stage_resource_cost_estimate_usd"] = (
+                        stage_seconds * RESOURCE_RATE_USD
+                    )
+                    if result.get("trained_updates"):
+                        result["requested_stage_resource_cost_per_update_usd"] = (
+                            stage_seconds
+                            * RESOURCE_RATE_USD
+                            / result["trained_updates"]
+                        )
+                        result["requested_steady_resource_cost_per_update_usd"] = (
+                            RESOURCE_RATE_USD / result["updates_per_second_elapsed"]
+                        )
+                    return result
                 return {
                     "stage": name,
                     "status": "worker_failed",
@@ -297,7 +325,7 @@ def benchmark(deadline_unix: float):
             safe.get("status") == "completed"
             and safe.get("training_finite")
             and memory_margin
-            and head_ratio >= 2
+            and (training_profile or head_ratio >= 2)
             and remaining >= 150
         )
         report["candidate_justification"] = {
@@ -305,6 +333,14 @@ def benchmark(deadline_unix: float):
             and safe.get("training_finite"),
             "safe_vram_below_quarter_capacity": memory_margin,
             "head_window_to_mean_completion_ratio": head_ratio,
+            "candidate_configuration": (
+                "micro8/global8, no activation checkpointing, completion window160"
+                if training_profile
+                else (
+                    "micro8/global8, no activation checkpointing, "
+                    "packed completion head"
+                )
+            ),
             "remaining_internal_seconds": remaining,
             "attempt_candidate": bool(justified),
         }
@@ -382,7 +418,10 @@ def deadline_watchdog(seconds, reason):
     return timer
 
 
-def run_benchmark():
+def run_benchmark(*, training_profile=False):
+    global HERE
+    HERE = PROFILE_DIR if training_profile else BENCHMARK_DIR
+    HERE.mkdir(parents=True, exist_ok=True)
     if not (PAYLOAD / "manifest.json").exists():
         raise RuntimeError(
             "Run prepare_modal_benchmark.py first and review the resource limits."
@@ -394,15 +433,18 @@ def run_benchmark():
         "app_id": app.app_id,
         "absolute_deadline_unix": deadline_unix,
         "active_seconds": ACTIVE_SECONDS,
-        "authorized_allowance_usd": 2.0,
+        "training_profile": training_profile,
+        "authorized_allowance_usd": 1.0 if training_profile else 2.0,
         "one_function_call_only": True,
         "caller_retries": 0,
     }
+    if training_profile:
+        launch["overall_accuracy_run_allowance_usd"] = 8.0
     (HERE / "launch.json").write_text(json.dumps(launch, indent=2) + "\n")
     watchdog = deadline_watchdog(ACTIVE_SECONDS, "active-deadline")
     succeeded = False
     try:
-        call = benchmark.spawn(deadline_unix)
+        call = benchmark.spawn(deadline_unix, training_profile=training_profile)
         report = call.get(timeout=max(1, deadline_unix - time.time() - 5))
         telemetry = report.pop("gpu_csv", "")
         (HERE / "result.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -439,12 +481,19 @@ def setup_progress_logging():
 
 
 @app.local_entrypoint()
-def main():
-    run_benchmark()
+def main(training_profile: bool = False):
+    run_benchmark(training_profile=training_profile)
 
 
 if __name__ == "__main__":
-    prepare_base_reproduction()
+    HERE.mkdir(parents=True, exist_ok=True)
+    if TRAINING_PROFILE:
+        if not (BASE_REPRO / "reproduction.json").exists():
+            raise RuntimeError(
+                "Training profile requires the frozen base reproduction."
+            )
+    else:
+        prepare_base_reproduction()
     setup_progress_logging()
     setup_seconds = 600 if SETUP_ONLY else BUILD_SECONDS
     setup_started = time.monotonic()
@@ -468,6 +517,6 @@ if __name__ == "__main__":
             if SETUP_ONLY:
                 stop_specific_app("setup-only-completed")
             else:
-                run_benchmark()
+                run_benchmark(training_profile=TRAINING_PROFILE)
     finally:
         build_watchdog.cancel()

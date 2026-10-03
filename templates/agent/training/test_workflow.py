@@ -449,6 +449,439 @@ class QualitySupplementTests(unittest.TestCase):
                 audit_quality_supplement([*rows, duplicate], [], [], [])
 
 
+class TrainingPlanTests(unittest.TestCase):
+    def setUp(self):
+        import numpy as np
+
+        self.np = np
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        data = self.root / "data"
+        data.mkdir()
+        self.tokens = data / "tokens-train.npz"
+        samples = [np.full(2 + index % 4, 100 + index, np.int32) for index in range(16)]
+        np.savez(
+            self.tokens,
+            tokens=np.concatenate(samples),
+            boundaries=np.cumsum([0, *map(len, samples)]),
+            offsets=np.ones(16, np.int32),
+        )
+        self.metadata = {"dataset_sha256": "data", "task_sha256": "task"}
+        (data / "tokens.json").write_text(json.dumps(self.metadata))
+        (self.root / "examples.jsonl").write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "id": f"train-{index}",
+                        "split": "train",
+                        "expected": call("no_action", reason="unsupported_request"),
+                        "provenance": "original" if index < 8 else "quality",
+                    }
+                )
+                + "\n"
+                for index in range(16)
+            )
+        )
+        self.plan = np.asarray(
+            [list(range(15, 7, -1)), list(range(8)), list(range(8, 16))],
+            dtype=np.int64,
+        )
+
+    def freeze_plan(self, plan, *, key="indices"):
+        import hashlib
+
+        path = self.tokens.with_name("train-plan.npz")
+        self.np.savez(path, **{key: plan})
+        self.metadata["files"] = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        }
+        path.with_name("tokens.json").write_text(json.dumps(self.metadata))
+        return path
+
+    def batch_indices(self, batches):
+        return [list(map(int, batch[:, 0] - 100)) for batch, _ in batches]
+
+    def test_frozen_order_and_repeated_exposure_ignore_the_shuffle_seed(self):
+        import hashlib
+
+        from gpu_benchmark import quality_batches
+
+        self.freeze_plan(self.plan)
+        exposure_path = self.root / "output/training-exposure.json"
+        batches, digest = quality_batches(
+            self.tokens, 66, 0, 3, exposure_path=exposure_path
+        )
+        alternate, alternate_digest = quality_batches(self.tokens, 123, 0, 3)
+        self.assertEqual(self.batch_indices(batches), self.plan.tolist())
+        self.assertEqual(self.batch_indices(alternate), self.plan.tolist())
+        self.assertEqual(digest, alternate_digest)
+        self.assertEqual(
+            digest, hashlib.sha256(self.plan.astype("<i8").tobytes()).hexdigest()
+        )
+        exposure = json.loads(exposure_path.read_text())
+        self.assertEqual(exposure["selected_indices"], self.plan.flatten().tolist())
+        self.assertEqual(
+            exposure["selected_ids"],
+            [f"train-{index}" for index in self.plan.flatten()],
+        )
+        self.assertEqual(exposure["training_batch_sha256"], digest)
+        self.assertEqual(exposure["selected_positions"], 24)
+        self.assertEqual(exposure["unique_examples"], 16)
+        self.assertEqual(exposure["coverage_fraction"], 1.0)
+        self.assertEqual(exposure["provenance_counts"], {"original": 8, "quality": 16})
+
+    def test_resume_skips_exact_completed_updates_and_hashes_only_the_suffix(self):
+        import hashlib
+
+        from gpu_benchmark import quality_batches
+
+        self.freeze_plan(self.plan)
+        exposure_path = self.root / "resume-exposure.json"
+        batches, digest = quality_batches(
+            self.tokens, 66, 1, 2, exposure_path=exposure_path
+        )
+        self.assertEqual(self.batch_indices(batches), self.plan[1:].tolist())
+        self.assertEqual(
+            digest, hashlib.sha256(self.plan[1:].astype("<i8").tobytes()).hexdigest()
+        )
+        exposure = json.loads(exposure_path.read_text())
+        self.assertEqual((exposure["resume_step"], exposure["updates"]), (1, 2))
+        self.assertEqual(exposure["selected_positions"], 16)
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            quality_batches(self.tokens, 66, 2, 2)
+
+    def test_legacy_seeded_length_batches_retain_full_coverage_and_resume_order(self):
+        from gpu_benchmark import quality_batches
+
+        full, _ = quality_batches(self.tokens, 66, 0, 5)
+        resumed, _ = quality_batches(self.tokens, 66, 3, 2)
+        expected = self.np.argsort(
+            [2 + index % 4 for index in range(16)], kind="stable"
+        ).reshape(-1, 8)
+        order = self.np.random.RandomState(66).permutation(2)
+        self.assertEqual(self.batch_indices(full[:2]), expected[order].tolist())
+        self.assertEqual(self.batch_indices(resumed), self.batch_indices(full[3:]))
+        self.assertEqual(
+            sorted(index for batch in self.batch_indices(full[:2]) for index in batch),
+            list(range(16)),
+        )
+
+    def test_frozen_plan_rejects_partial_invalid_and_missing_examples(self):
+        from gpu_benchmark import quality_batches
+
+        negative = self.plan.copy()
+        negative[0, 0] = -1
+        outside = self.plan.copy()
+        outside[0, 0] = 16
+        missing = self.np.where(self.plan == 15, 14, self.plan)
+        duplicate = self.plan.copy()
+        duplicate[0, 0] = duplicate[0, 1]
+        for plan, message in (
+            (self.plan.astype(float), "integer batches"),
+            (self.plan.astype(bool), "integer batches"),
+            (self.plan[:, :7], "integer batches"),
+            (self.plan[:0], "integer batches"),
+            (negative, "integer batches"),
+            (outside, "integer batches"),
+            (missing, "cover every"),
+            (duplicate, "within a batch"),
+        ):
+            with self.subTest(message=message, dtype=str(plan.dtype)):
+                self.freeze_plan(plan)
+                with self.assertRaisesRegex(ValueError, message):
+                    quality_batches(self.tokens, 66, 0, 1)
+        self.freeze_plan(self.plan, key="other")
+        with self.assertRaisesRegex(ValueError, "indices matrix"):
+            quality_batches(self.tokens, 66, 0, 1)
+
+    def test_missing_or_changed_plan_hash_prevents_training(self):
+        from gpu_benchmark import quality_batches
+
+        path = self.freeze_plan(self.plan)
+        path.write_bytes(path.read_bytes() + b"changed")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            quality_batches(self.tokens, 66, 0, 3)
+        self.freeze_plan(self.plan)
+        self.metadata.pop("files")
+        path.with_name("tokens.json").write_text(json.dumps(self.metadata))
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            quality_batches(self.tokens, 66, 0, 3)
+
+
+class QualityResumeTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        (self.root / "data").mkdir()
+        self.metadata = {
+            "dataset_sha256": "data",
+            "task_sha256": "task",
+            "files": {"train-plan.npz": "plan"},
+        }
+        (self.root / "data/tokens.json").write_text(json.dumps(self.metadata))
+        self.config = {
+            "quality_updates": 3900,
+            "seed": 66,
+            "refinement_micro_batch": 2,
+            "completion_window": 160,
+        }
+        warm = self.root / "warm-start.safetensors"
+        warm.write_bytes(b"baseline weights")
+        (self.root / "warm-start.json").write_text(
+            json.dumps(
+                {
+                    "initialization": "weights_only",
+                    "adapter_sha256": hashlib.sha256(warm.read_bytes()).hexdigest(),
+                }
+            )
+        )
+
+    def retain_checkpoint(self):
+        import hashlib
+
+        from gpu_benchmark import quality_config_hash
+
+        resume = self.root / "resume"
+        resume.mkdir(exist_ok=True)
+        hashes = {}
+        for name in ("adapters", "optimizer", "random"):
+            path = resume / f"{name}.safetensors"
+            path.write_bytes(f"retained {name}".encode())
+            hashes[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        progress = {
+            **self.metadata,
+            "step": 500,
+            "schedule_offset": 0,
+            "config_sha256": quality_config_hash(self.config),
+            "training_plan_sha256": "plan",
+            "state_files": hashes,
+        }
+        (resume / "progress.json").write_text(json.dumps(progress))
+        return progress
+
+    def test_fresh_weights_start_zero_but_verified_checkpoint_takes_precedence(self):
+        from gpu_benchmark import quality_training_state
+
+        progress, weights_only = quality_training_state(self.root, self.config)
+        self.assertTrue(weights_only)
+        self.assertEqual((progress["step"], progress["schedule_offset"]), (0, 0))
+        expected = self.retain_checkpoint()
+        progress, weights_only = quality_training_state(self.root, self.config)
+        self.assertFalse(weights_only)
+        self.assertEqual(progress, expected)
+        self.assertTrue((self.root / "warm-start.json").exists())
+
+    def test_resume_requires_dataset_task_config_plan_and_absolute_step_identity(self):
+        from gpu_benchmark import quality_training_state
+
+        retained = self.retain_checkpoint()
+        for changes, message in (
+            ({"dataset_sha256": "other"}, "dataset or task"),
+            ({"task_sha256": "other"}, "dataset or task"),
+            ({"config_sha256": "other"}, "configuration checksum"),
+            ({"training_plan_sha256": "other"}, "plan checksum"),
+            ({"step": 500.0}, "invalid update step"),
+            ({"schedule_offset": 501}, "invalid update step"),
+            ({"step": 0}, "precede the training target"),
+            ({"step": 3900}, "precede the training target"),
+        ):
+            with self.subTest(changes=changes):
+                (self.root / "resume/progress.json").write_text(
+                    json.dumps({**retained, **changes})
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    quality_training_state(self.root, self.config)
+        (self.root / "resume/progress.json").write_text(json.dumps(retained))
+        for changes in (
+            {"refinement_micro_batch": 8},
+            {"refinement_checkpoint": "none"},
+            {"completion_window": 192},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, "configuration checksum"):
+                    quality_training_state(self.root, {**self.config, **changes})
+
+    def test_partial_or_tampered_state_cannot_restart_silently(self):
+        from gpu_benchmark import quality_training_state
+
+        self.retain_checkpoint()
+        for name in ("adapters", "optimizer", "random"):
+            with self.subTest(name=name):
+                path = self.root / f"resume/{name}.safetensors"
+                retained = path.read_bytes()
+                path.unlink()
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    quality_training_state(self.root, self.config)
+                path.write_bytes(retained + b"changed")
+                with self.assertRaisesRegex(ValueError, "state checksum mismatch"):
+                    quality_training_state(self.root, self.config)
+                path.write_bytes(retained)
+        (self.root / "warm-start.safetensors").write_bytes(b"changed baseline")
+        with self.assertRaisesRegex(ValueError, "starting weights"):
+            quality_training_state(self.root, self.config)
+
+    def test_legacy_retained_state_preserves_existing_layout(self):
+        from gpu_benchmark import quality_training_state
+
+        self.retain_checkpoint()
+        (self.root / "warm-start.json").unlink()
+        (self.root / "resume/adapters.safetensors").unlink()
+        progress = {**self.metadata, "step": 15000, "schedule_offset": 0}
+        (self.root / "resume/progress.json").write_text(json.dumps(progress))
+        state, weights_only = quality_training_state(self.root, self.config)
+        self.assertFalse(weights_only)
+        self.assertEqual(state, progress)
+
+    def test_refinement_profile_defaults_to_all_and_only_allows_all_or_none(self):
+        from gpu_benchmark import CASES, quality_settings
+
+        original = CASES["baseline"].copy()
+        self.assertEqual(
+            quality_settings(original, self.config),
+            {**original, "micro": 2, "checkpoint": "all"},
+        )
+        self.assertEqual(
+            quality_settings(
+                original,
+                {
+                    **self.config,
+                    "refinement_micro_batch": 8,
+                    "refinement_checkpoint": "none",
+                },
+            ),
+            {**original, "micro": 8, "checkpoint": "none"},
+        )
+        with self.assertRaisesRegex(ValueError, "all or none"):
+            quality_settings(original, {"refinement_checkpoint": "half"})
+        self.assertEqual(CASES["baseline"], original)
+
+
+class ModalPipelineTests(unittest.TestCase):
+    def import_pipeline(self):
+        import importlib.util
+        import sys
+        from types import ModuleType
+
+        image = Mock()
+        image.add_local_dir.return_value = image
+        image.add_local_file.return_value = image
+        benchmark = ModuleType("modal_benchmark")
+        benchmark.image = image
+        benchmark.setup_progress_logging = Mock()
+        modal = ModuleType("modal")
+        modal.App = Mock(
+            return_value=SimpleNamespace(
+                app_id="offline-app",
+                function=lambda **kwargs: lambda function: function,
+            )
+        )
+        modal.Volume = SimpleNamespace(from_name=Mock(return_value=Mock()))
+        spec = importlib.util.spec_from_file_location(
+            "offline_modal_training", Path(__file__).with_name("modal_training.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"modal": modal, "modal_benchmark": benchmark}):
+            spec.loader.exec_module(module)
+        return module
+
+    def test_native_report_must_pass_with_matching_weights_before_fresh_testing(self):
+        module = self.import_pipeline()
+        for status, matching_hash in (
+            ("failed", True),
+            ("passed", False),
+            ("passed", True),
+        ):
+            with self.subTest(status=status, matching_hash=matching_hash):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    input_path = root / "input"
+                    input_path.mkdir()
+                    (input_path / "manifest.json").write_text(
+                        json.dumps(
+                            {"configuration": {"checkpoint_selection_steps": [650]}}
+                        )
+                    )
+                    selected = root / "download/refinement/selected/adapter"
+                    selected.mkdir(parents=True)
+                    weights = selected / "adapters.safetensors"
+                    weights.write_bytes(b"selected weights")
+                    selected_sha = module.digest(weights)
+                    native_report = {
+                        "status": status,
+                        "adapter_sha256": selected_sha if matching_hash else "other",
+                    }
+                    run = {
+                        "run_name": "v8-offline",
+                        "billing_baseline_usd": 0,
+                        "test_set_used": False,
+                    }
+                    pool = {
+                        "document_agreement_rate": 1.0,
+                        "selection_agreement_rate": 1.0,
+                        "camera_agreement_rate": 1.0,
+                    }
+
+                    def remote_result(_run_name, mode, *_args, _pool=pool):
+                        metrics = {"original": _pool, "supplement": _pool}
+                        response = {
+                            "report": {"metrics": metrics if mode == "full" else {}},
+                            "artifacts": {},
+                            "function_seconds": 0,
+                        }
+                        return SimpleNamespace(get=Mock(return_value=response))
+
+                    def native_exit_zero(
+                        *args, _root=root, _report=native_report, **kwargs
+                    ):
+                        target = _root / "native-check/result.json"
+                        target.parent.mkdir()
+                        target.write_text(json.dumps(_report))
+                        return SimpleNamespace(returncode=0)
+
+                    spawn = Mock(side_effect=remote_result)
+                    with (
+                        patch.object(module, "HERE", root),
+                        patch.object(module, "INPUT", input_path),
+                        patch.object(module, "run_task", SimpleNamespace(spawn=spawn)),
+                        patch.object(module, "download_artifacts"),
+                        patch.object(module, "billing", side_effect=AssertionError),
+                        patch.object(
+                            module.subprocess, "run", side_effect=native_exit_zero
+                        ),
+                        patch(
+                            "gpu_benchmark.choose_checkpoint",
+                            return_value={"chosen_step": 650},
+                        ),
+                        patch("gpu_benchmark.checkpoint_regressions", return_value=[]),
+                        patch.object(module, "print", create=True),
+                    ):
+                        module.pipeline(run, module.time.time() + 600)
+                    test_calls = [
+                        invocation.args
+                        for invocation in spawn.call_args_list
+                        if invocation.args[1] == "test"
+                    ]
+                    persisted = json.loads((root / "run.json").read_text())
+                    self.assertEqual(persisted["native_verification"], native_report)
+                    if status == "passed" and matching_hash:
+                        self.assertEqual(run["status"], "complete")
+                        self.assertTrue(run["promotion_passed"])
+                        self.assertTrue(run["test_set_used"])
+                        self.assertEqual(len(test_calls), 1)
+                        self.assertEqual(test_calls[0][2:4], ("selected", 650))
+                        self.assertTrue(test_calls[0][-1])
+                    else:
+                        self.assertEqual(run["status"], "native_check_failed")
+                        self.assertFalse(run["promotion_passed"])
+                        self.assertFalse(run["test_set_used"])
+                        self.assertEqual(test_calls, [])
+                        self.assertEqual(persisted["status"], "native_check_failed")
+
+
 class CheckpointSelectionRecoveryTests(unittest.TestCase):
     def completed_run(self, root, *, promoted=True):
         import hashlib

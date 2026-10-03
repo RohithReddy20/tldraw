@@ -2,6 +2,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -149,22 +150,57 @@ def quality_batches(path, seed, resume_step, updates=500, *, exposure_path=None)
     groups = order[: len(order) // 8 * 8].reshape(-1, 8)
     random = np.random.RandomState(seed)
     batches, selected = [], []
-    step = 0
-    while len(batches) < updates:
-        for group in random.permutation(len(groups)):
-            if step >= resume_step:
-                indices = groups[group]
-                lengths = sizes[indices]
-                width = 1 + 32 * ((int(max(lengths)) + 31) // 32)
-                batch = np.zeros((8, width), dtype=np.int32)
-                for row, index in enumerate(indices):
-                    begin, end = boundaries[index : index + 2]
-                    batch[row, : end - begin] = tokens[begin:end]
-                batches.append((batch, np.column_stack((offsets[indices], lengths))))
-                selected.extend(map(int, indices))
-                if len(batches) == updates:
-                    break
-            step += 1
+    plan_path = path.with_name("train-plan.npz")
+    if plan_path.exists():
+        metadata = json.loads(path.with_name("tokens.json").read_text())
+        expected = metadata.get("files", {}).get(plan_path.name)
+        if (
+            not expected
+            or hashlib.sha256(plan_path.read_bytes()).hexdigest() != expected
+        ):
+            raise ValueError("Frozen training plan checksum mismatch.")
+        with np.load(plan_path, allow_pickle=False) as arrays:
+            if "indices" not in arrays:
+                raise ValueError("Frozen training plan requires an indices matrix.")
+            plan = arrays["indices"]
+        if (
+            plan.ndim != 2
+            or plan.shape[1] != 8
+            or len(plan) == 0
+            or plan.dtype.kind not in "iu"
+            or np.any(plan < 0)
+            or np.any(plan >= len(sizes))
+        ):
+            raise ValueError(
+                "Frozen training plan needs valid integer batches of eight."
+            )
+        if np.unique(plan).size != len(sizes):
+            raise ValueError("Frozen training plan must cover every training example.")
+        ordered = np.sort(plan, axis=1)
+        if np.any(ordered[:, 1:] == ordered[:, :-1]):
+            raise ValueError("Frozen training plan repeats an example within a batch.")
+        if resume_step + updates > len(plan):
+            raise ValueError("Requested updates exceed the frozen training plan.")
+        indices_by_step = plan[resume_step : resume_step + updates]
+    else:
+        indices_by_step = []
+        step = 0
+        while len(indices_by_step) < updates:
+            for group in random.permutation(len(groups)):
+                if step >= resume_step:
+                    indices_by_step.append(groups[group])
+                    if len(indices_by_step) == updates:
+                        break
+                step += 1
+    for indices in indices_by_step:
+        lengths = sizes[indices]
+        width = 1 + 32 * ((int(max(lengths)) + 31) // 32)
+        batch = np.zeros((8, width), dtype=np.int32)
+        for row, index in enumerate(indices):
+            begin, end = boundaries[index : index + 2]
+            batch[row, : end - begin] = tokens[begin:end]
+        batches.append((batch, np.column_stack((offsets[indices], lengths))))
+        selected.extend(map(int, indices))
     digest = hashlib.sha256(np.asarray(selected, dtype="<i8").tobytes()).hexdigest()
     if exposure_path is not None:
         from training import write_training_exposure
@@ -182,6 +218,70 @@ def quality_batches(path, seed, resume_step, updates=500, *, exposure_path=None)
         exposure_path.parent.mkdir(parents=True, exist_ok=True)
         exposure_path.write_text(json.dumps(exposure, indent=2))
     return batches, digest
+
+
+def quality_config_hash(config):
+    return hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def quality_settings(settings, config):
+    checkpoint = config.get("refinement_checkpoint", "all")
+    if checkpoint not in {"all", "none"}:
+        raise ValueError("Refinement checkpointing must be all or none.")
+    return {
+        **settings,
+        "micro": config.get("refinement_micro_batch", settings["micro"]),
+        "checkpoint": checkpoint,
+    }
+
+
+def quality_training_state(root, config):
+    metadata = json.loads((root / "data/tokens.json").read_text())
+    refinement = (root / "warm-start.json").exists()
+    state_path = root / "resume"
+    files = (
+        "adapters.safetensors",
+        "optimizer.safetensors",
+        "random.safetensors",
+        "progress.json",
+    )
+    exact_resume = refinement and any((state_path / name).exists() for name in files)
+    if refinement:
+        warm = json.loads((root / "warm-start.json").read_text())
+        if warm.get("initialization") != "weights_only" or hashlib.sha256(
+            (root / "warm-start.safetensors").read_bytes()
+        ).hexdigest() != warm["adapter_sha256"]:
+            raise ValueError("Refinement starting weights failed verification.")
+    if refinement and not exact_resume:
+        return {**metadata, "step": 0, "schedule_offset": 0}, True
+    required = files if exact_resume else files[1:]
+    if any(not (state_path / name).is_file() for name in required):
+        raise ValueError("Retained training state is incomplete.")
+    resume = json.loads((state_path / "progress.json").read_text())
+    if any(
+        resume.get(key) != metadata[key] for key in ("dataset_sha256", "task_sha256")
+    ):
+        raise ValueError("Retained training state differs from the dataset or task.")
+    step, offset = resume.get("step"), resume.get("schedule_offset")
+    if type(step) is not int or type(offset) is not int or not 0 <= offset <= step:
+        raise ValueError("Retained training state has an invalid update step.")
+    if exact_resume:
+        if not 0 < step < config.get("quality_updates", 500):
+            raise ValueError("Retained update must precede the training target.")
+        if resume.get("config_sha256") != quality_config_hash(config):
+            raise ValueError("Retained training configuration checksum mismatch.")
+        if resume.get("training_plan_sha256") != metadata.get("files", {}).get(
+            "train-plan.npz"
+        ):
+            raise ValueError("Retained training plan checksum mismatch.")
+        for name in files[:-1]:
+            if resume.get("state_files", {}).get(name) != hashlib.sha256(
+                (state_path / name).read_bytes()
+            ).hexdigest():
+                raise ValueError(f"Retained training state checksum mismatch: {name}")
+    return resume, False
 
 
 def checkpoint_layers(model, mode):
@@ -252,11 +352,12 @@ def worker(root, output, case, verify=False, quality=False):
 
         mx.distributed.all_sum = gpu_all_sum
     config = yaml.safe_load((root / "config.yaml").read_text())
-    if quality and (root / "warm-start.json").exists():
-        settings = {
-            **settings,
-            "micro": config.get("refinement_micro_batch", settings["micro"]),
-        }
+    refinement = (root / "warm-start.json").exists()
+    warm_start = refinement
+    if quality:
+        resume, warm_start = quality_training_state(root, config)
+    if quality and refinement:
+        settings = quality_settings(settings, config)
     accumulation = 8 // (settings["micro"] * workers)
     if accumulation < 1 or settings["micro"] * workers * accumulation != 8:
         raise ValueError("Micro batches must preserve global batch eight.")
@@ -268,10 +369,15 @@ def worker(root, output, case, verify=False, quality=False):
     model, _ = load(model_path("float16"))
     model.freeze()
     linear_to_lora_layers(model, config["num_layers"], config["lora_parameters"])
-    model.load_weights(str(root / "warm-start.safetensors"), strict=False)
+    resumed_adapter = root / "resume/adapters.safetensors"
+    adapter_source = (
+        resumed_adapter
+        if quality and refinement and not warm_start
+        else root / "warm-start.safetensors"
+    )
+    model.load_weights(str(adapter_source), strict=False)
     if settings.get("dtype") == "float32":
         model.set_dtype(mx.float32)
-    warm_start = (root / "warm-start.json").exists()
     if warm_start:
         np.random.seed(config["seed"])
         mx.random.seed(config["seed"])
@@ -279,19 +385,14 @@ def worker(root, output, case, verify=False, quality=False):
         restore_random_state(mx.load(str(root / "resume/random.safetensors"))["key"])
     checkpoint_layers(model, settings["checkpoint"])
     if quality:
-        if warm_start:
-            resume = {
-                **json.loads((root / "data/tokens.json").read_text()),
-                "step": 0,
-                "schedule_offset": 0,
-            }
-        else:
-            resume = json.loads((root / "resume/progress.json").read_text())
+        remaining_updates = config.get("quality_updates", 500) - (
+            resume["step"] if refinement else 0
+        )
         raw_batches, batch_digest = quality_batches(
             root / "data/tokens-train.npz",
             config["seed"],
             resume["step"],
-            updates=config.get("quality_updates", 500),
+            updates=remaining_updates,
             exposure_path=output / "training-exposure.json"
             if rank == 0 and config.get("checkpoint_selection_steps")
             else None,
@@ -343,6 +444,13 @@ def worker(root, output, case, verify=False, quality=False):
     initial_loss = mx.distributed.all_sum(initial_loss) / (workers * accumulation)
     mx.eval(initial_loss, gradients)
     initial_loss = initial_loss.item()
+    if quality and (
+        not math.isfinite(initial_loss)
+        or not mx.stack(
+            [mx.all(mx.isfinite(value)) for _, value in tree_flatten(gradients)]
+        ).all().item()
+    ):
+        raise ValueError("Initial training loss or gradients are not finite.")
     if rank == 0:
         mx.save_safetensors(
             str(output / "gradients.safetensors"), dict(tree_flatten(gradients))
@@ -382,7 +490,7 @@ def worker(root, output, case, verify=False, quality=False):
             (output / "config.yaml").write_text(
                 yaml.safe_dump({**config, "model_dtype": "float16"}, sort_keys=False)
             )
-            if warm_start:
+            if refinement:
                 (output / "data").mkdir(exist_ok=True)
                 shutil.copyfile(root / "data/tokens.json", output / "data/tokens.json")
     else:
@@ -390,7 +498,7 @@ def worker(root, output, case, verify=False, quality=False):
         adapter_file = output / "benchmark-adapters.safetensors"
     reports = []
     updates, interval, warmup = (
-        (config.get("quality_updates", 500), 50, 50)
+        (remaining_updates, 50, 50)
         if quality
         else ((80, 8, 16) if verify else (24, 4, 12))
     )
@@ -399,15 +507,21 @@ def worker(root, output, case, verify=False, quality=False):
     class Reports(TrainingCallback):
         def on_train_loss_report(self, info):
             nonlocal steady_started
+            if quality and not math.isfinite(info["train_loss"]):
+                raise ValueError("Training loss is not finite.")
             reports.append(info)
             if info["iteration"] == warmup * accumulation:
                 steady_started = time.time()
-            completed = info["iteration"] // accumulation
+            completed = info["iteration"] // accumulation + (
+                resume["step"] if quality else 0
+            )
             if (
-                warm_start
+                refinement
+                and quality
                 and rank == 0
                 and (
                     completed == 50
+                    or completed == config.get("quality_updates", 500)
                     or completed % config.get("save_every", 500) == 0
                     or completed in config.get("checkpoint_selection_steps", [])
                 )
@@ -417,9 +531,32 @@ def worker(root, output, case, verify=False, quality=False):
                     optimizer,
                     adapter_file.parent,
                     completed,
-                    0,
+                    resume["schedule_offset"],
                     archive=False,
                 )
+                checkpoint = adapter_file.parent / "checkpoints" / f"{completed:07d}"
+                progress = json.loads((checkpoint / "progress.json").read_text())
+                progress.update(
+                    config_sha256=quality_config_hash(config),
+                    training_plan_sha256=json.loads(
+                        (root / "data/tokens.json").read_text()
+                    )
+                    .get("files", {})
+                    .get("train-plan.npz"),
+                    state_files={
+                        name: hashlib.sha256(
+                            (checkpoint / name).read_bytes()
+                        ).hexdigest()
+                        for name in (
+                            "adapters.safetensors",
+                            "optimizer.safetensors",
+                            "random.safetensors",
+                        )
+                    },
+                )
+                pending = checkpoint / "progress.json.tmp"
+                pending.write_text(json.dumps(progress))
+                pending.replace(checkpoint / "progress.json")
 
     def iterator(**kwargs):
         while True:
@@ -446,12 +583,22 @@ def worker(root, output, case, verify=False, quality=False):
     )
     if rank != 0:
         return
+    if quality and not mx.stack(
+        [
+            mx.all(mx.isfinite(value))
+            for _, value in tree_flatten(model.trainable_parameters())
+        ]
+    ).all().item():
+        raise ValueError("Final trained adapter is not finite.")
     steady = [
         report["iterations_per_second"] / accumulation
         for report in reports
         if report["iteration"] > warmup * accumulation
     ]
-    rate = statistics.median(steady)
+    measured = steady or [
+        report["iterations_per_second"] / accumulation for report in reports
+    ]
+    rate = statistics.median(measured)
     result = {
         "case": case,
         "settings": settings,
@@ -462,8 +609,8 @@ def worker(root, output, case, verify=False, quality=False):
         "initial_loss": initial_loss,
         "updates_per_second": rate,
         "examples_per_second": 8 * rate,
-        "min_updates_per_second": min(steady),
-        "max_updates_per_second": max(steady),
+        "min_updates_per_second": min(measured),
+        "max_updates_per_second": max(measured),
         "peak_memory_gb_per_worker": mx.get_peak_memory() / 1e9,
         "training_seconds_including_warmup": time.monotonic() - started,
         "steady_started_at": steady_started,
@@ -488,6 +635,13 @@ def worker(root, output, case, verify=False, quality=False):
             model_revision="bb327a9ad61044e1496a2bee2365a6b6a6684c72",
             initialization="weights_only" if warm_start else "exact_resume",
             warm_start_source_step=config.get("warm_start_source_step"),
+            training_target=config.get("quality_updates", 500)
+            if refinement
+            else resume["step"] + updates,
+            training_finite=True,
+            resumed_adapter_sha256=hashlib.sha256(adapter_source.read_bytes()).hexdigest()
+            if not warm_start
+            else None,
         )
     (output / "result.json").write_text(json.dumps(result, indent=2))
     print("RESULT " + json.dumps(result), flush=True)

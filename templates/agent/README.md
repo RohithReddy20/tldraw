@@ -799,10 +799,76 @@ The second stage failed its first numerical comparison: initial loss differed by
 performed no optimizer updates. The existing trainer remains the retained
 configuration; that numerical failure does not measure task accuracy. GPU
 function time was 217.74 seconds, with a requested-resource cost estimate of
-$0.258 excluding image setup and idle time. Modal reported about $0.39 of
-cumulative credit consumption and no cash charges immediately after stopping all
-benchmark apps; billing records can lag. The improved quality supplement remains
-untrained.
+$0.258 excluding image setup and idle time. The settled ledger before the next
+profile recorded about $0.31 of cumulative credit consumption and no cash
+charges; billing records can lag.
+
+A separate `--training-profile` measurement retained the 160-token completion
+window and tested one larger batch, without the packed output-head experiment.
+It permits a finite candidate to be timed after recording numerical differences;
+it does not assert numerical equivalence or action accuracy. Both configurations
+completed 48 finite updates:
+
+| Measure                       | Micro batch two, checkpoint all | Micro batch eight, no checkpoint |
+| ----------------------------- | ------------------------------- | -------------------------------- |
+| Steady elapsed updates/second | 1.531                           | 1.371                            |
+| Mean sampled GPU activity     | 60.00%                          | 48.21%                           |
+| Peak sampled VRAM             | 9,027 MiB                       | 63,655 MiB                       |
+| Estimated cost/update         | $0.000774                       | $0.000864                        |
+
+The larger batch was slower and cost about 12% more per update. The quality run
+therefore uses micro batch two, accumulation four, and checkpointing of all
+layers. This is the faster of the two measured configurations; full H100
+utilization and optimal cost across GPU types have not been established. The
+second profile consumed about $0.32 of credits, bringing cumulative metered usage
+to about $0.63 with no cash billed. Its app is stopped.
+
+#### Bounded Modal quality training
+
+`training/prepare_modal_training.py` creates an immutable version-eight input
+using CPU tokenization. It combines the 24,000 original training rows with the
+reviewed 2,400-row quality supplement. An exact 3,900-update plan exposes each
+original row once and each supplemental row three times, for 31,200 positions at
+effective batch eight. Every 13-update block contains ten original batches and
+three supplemental batches. Hashes and per-example exposure counts record this
+order.
+
+A training-only canvas overlay sets frame colors to black and short note sizes
+to 200 by 200, matching the native execution context. It preserves commands,
+IDs, history, and action labels, and records every changed field. Original
+development and test fixtures remain byte-identical. Session replay is checked
+before this overlay; exact native geometry equivalence is not claimed.
+
+The single-H100 trainer starts from the verified version-six adapter, with
+rank-32 LoRA on all layers, FP16 weights, completion window 160, and a 5e-6
+learning rate. It retains optimizer and random state at periodic and selection
+checkpoints. Recovery requires matching data, configuration, training-plan,
+checkpoint-step, and state-file hashes. A committed Modal volume preserves the
+checkpoints across container exits.
+
+Run from the monorepo root with the same prepared base, frozen version-seven
+inputs, and reviewed supplement as above:
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/prepare_modal_training.py --micro-batch 2 --checkpoint all
+uv run --no-project --isolated --with modal==1.6.0 python templates/agent/training/modal_training.py
+```
+
+The local allowance is $8 in credits, including the additional profile. The
+runner disables retries, limits the app to one H100 container, bounds setup to
+five minutes and active work to at most 105 minutes, and monitors metered usage.
+The deadline is preserved during recovery. These controls are estimates and
+watchdogs, not an account spending cap; billing can lag. Inputs, live logs,
+verified downloads, stop receipts, and billing snapshots live under
+`training/runs/v8-quality-modal/`.
+
+Checkpoints 650, 1,950, and 3,900 first face the unchanged 256-command/six-session
+selection gate. The chosen checkpoint then faces separate full original and
+supplement development gates, including per-action regressions and document,
+selection, and camera state. Native SDK checks must pass for the exact downloaded
+adapter before scoring the reserved test set. If any gate fails, the retained
+baseline remains selected. Preparation and throughput measurements do not
+establish improved accuracy; that requires the completed validation reports.
 
 #### Accuracy trial for the faster trainer
 
