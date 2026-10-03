@@ -935,6 +935,37 @@ separate immutable input and cloud run name, with one GPU container and the same
 deadline, usage monitor, checkpoint, and stop controls. Training and evaluation
 run on Modal; local preparation only audits and tokenizes data on CPU.
 
+The English run completed all 400 updates from source commit `d72f162b4` in
+583 seconds, including warmup and saves. Median steady speed was 1.194 optimizer
+updates per second; elapsed speed was 0.687. All checked weights remained finite,
+and peak MLX allocation was 10.19 GB. Training and targeted scoring finished, and
+the GPU app is stopped.
+
+Both adapters were scored using the same updated guard. The original subset
+contains 256 commands and six sessions totaling 192 turns. The separate English
+pool contains 200 commands and four twelve-turn sessions:
+
+| Development pool | Adapter              | Exact commands   | Exact session actions | Complete state matches |
+| ---------------- | -------------------- | ---------------- | --------------------- | ---------------------- |
+| Original subset  | Retained version six | 202/256 (78.91%) | 68/192 (35.42%)       | 8/192 (4.17%)          |
+| Original subset  | English update 400   | 230/256 (89.84%) | 103/192 (53.65%)      | 10/192 (5.21%)         |
+| English pool     | Retained version six | 84/200 (42.00%)  | 9/48 (18.75%)         | 1/48 (2.08%)           |
+| English pool     | English update 400   | 135/200 (67.50%) | 41/48 (85.42%)        | 34/48 (70.83%)         |
+
+The original subset rejected the candidate for regressions in add-method, undo,
+zoom-to-fit, shape creation, and missing-target cases. The English command pool
+also regressed on add-property and ambiguous/missing-target refusals. Both
+adapters caused three unwanted mutations in each session pool, with no perfect
+sessions or matching final states. The retained adapter remains selected; full
+development, native replacement checks, and fresh test scoring did not run.
+
+These are synthetic development results, with only four short English sessions.
+They do not establish spontaneous speech or long-session reliability. The warm
+start differs from the comparison baseline, so the result does not isolate the
+effect of the new English data. Results and frozen inputs are under
+`training/runs/v9-english-modal/`. The recorded account ledger shows about $7.08
+total metered usage, covered by credits with zero cash billed.
+
 #### Accuracy trial for the faster trainer
 
 Notebook version 6 resumed the same retained update-5,000 adapter and optimizer
