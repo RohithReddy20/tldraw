@@ -18,14 +18,24 @@ from modal_benchmark import image as benchmark_image
 from modal_benchmark import setup_progress_logging
 
 TRAINING = Path(__file__).resolve().parent
-HERE = TRAINING / "runs/v8-quality-modal"
+HERE = Path(
+    os.environ.get("CANVAS_MODAL_RUN_DIRECTORY", TRAINING / "runs/v8-quality-modal")
+)
 INPUT = HERE / "input"
 INPUT_ZIP = HERE / "input.zip"
+RUN_PREFIX = os.environ.get("CANVAS_MODAL_RUN_PREFIX", "v8")
+if not re.fullmatch(r"v[89]", RUN_PREFIX):
+    raise ValueError("Use a separate v8 or v9 frozen run directory.")
 VOLUME_NAME = "canvas-270m-quality-checkpoints"
 BUDGET_USD = 8.0
+BILLING_BASELINE = Path(
+    os.environ.get(
+        "CANVAS_MODAL_BILLING_BASELINE", HERE / "profile/billing-before.json"
+    )
+)
 ACTIVE_SECONDS = 6300
 RESOURCE_RATE_USD = 0.00118492
-app = modal.App("canvas-270m-v8-quality")
+app = modal.App(f"canvas-270m-{RUN_PREFIX}-quality")
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 image = benchmark_image.add_local_file(
     str(INPUT_ZIP), remote_path="/job-input.zip"
@@ -58,9 +68,9 @@ def digest(path):
     serialized=True,
 )
 def run_task(run_name, mode, case, step, deadline_unix, native_passed=False):
-    if not re.fullmatch(r"v8-[a-f0-9]{12}", run_name):
+    if not re.fullmatch(r"v[89]-[a-f0-9]{12}", run_name):
         raise ValueError("Invalid frozen run name.")
-    if mode not in ("train", "selection", "full", "test"):
+    if mode not in ("train", "selection", "language", "full", "test"):
         raise ValueError("Invalid training task.")
     job = Path("/job")
     with zipfile.ZipFile("/job-input.zip") as archive:
@@ -304,7 +314,8 @@ def download_artifacts(run_name, files):
 def pipeline(run, deadline):
     from gpu_benchmark import checkpoint_regressions, choose_checkpoint
 
-    config = json.loads((INPUT / "manifest.json").read_text())["configuration"]
+    manifest = json.loads((INPUT / "manifest.json").read_text())
+    config = manifest["configuration"]
     stop_budget = threading.Event()
 
     def monitor_budget():
@@ -383,8 +394,37 @@ def pipeline(run, deadline):
         selection = choose_checkpoint(baseline, candidates)
         run.update(selection=selection, promotion_passed=False, test_set_used=False)
         save_run(run)
+        if manifest.get("refinement_mode") == "lexical":
+            language_baseline = task("language")["metrics"]
+            language_candidates = {
+                step: task("language", f"step-{step}", step)["metrics"]
+                for step in candidates
+            }
+            run["language_validation"] = {
+                "baseline": language_baseline,
+                "candidates": language_candidates,
+                "regressions": {
+                    step: checkpoint_regressions(language_baseline, metrics)
+                    + [
+                        key
+                        for key in (
+                            "document_agreement_rate",
+                            "selection_agreement_rate",
+                            "camera_agreement_rate",
+                        )
+                        if metrics[key] < language_baseline[key]
+                    ]
+                    for step, metrics in language_candidates.items()
+                },
+                "development_set_used": True,
+                "test_set_used": False,
+            }
+            save_run(run)
         chosen = selection["chosen_step"]
         if not chosen:
+            run["status"] = "complete_retained_baseline"
+            return
+        if run.get("language_validation", {}).get("regressions", {}).get(chosen):
             run["status"] = "complete_retained_baseline"
             return
         before = task("full", "baseline")["metrics"]
@@ -457,6 +497,12 @@ def pipeline(run, deadline):
 def main():
     HERE.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((INPUT / "manifest.json").read_text())
+    if (manifest.get("refinement_mode") == "lexical") != (RUN_PREFIX == "v9"):
+        raise ValueError("The run prefix must match its frozen refinement mode.")
+    for name in ("modal_training.py", "modal_training_worker.py"):
+        expected = manifest.get("source_sha256", {}).get(name)
+        if expected and digest(TRAINING / name) != expected:
+            raise ValueError(f"Frozen Modal source changed: {name}")
     for name, sha in manifest["files"].items():
         if digest(INPUT / name) != sha:
             raise ValueError(f"Prepared input changed: {name}")
@@ -503,7 +549,7 @@ def main():
             raise TimeoutError("The original run deadline has expired.")
     else:
         initial = billing()
-        baseline_file = HERE / "profile/billing-before.json"
+        baseline_file = BILLING_BASELINE
         baseline = (
             json.loads(baseline_file.read_text()) if baseline_file.exists() else initial
         )
@@ -514,7 +560,7 @@ def main():
             "billing_before": initial,
             "billing_scope_includes_profile": baseline_file.exists(),
             "input_manifest_sha256": digest(INPUT / "manifest.json"),
-            "run_name": "v8-" + digest(INPUT / "manifest.json")[:12],
+            "run_name": RUN_PREFIX + "-" + digest(INPUT / "manifest.json")[:12],
             "test_set_used": False,
             "source_sha256": {
                 name: digest(TRAINING / name)

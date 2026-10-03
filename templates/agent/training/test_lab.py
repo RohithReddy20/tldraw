@@ -55,6 +55,287 @@ class RefinementDataTests(unittest.TestCase):
             )
 
 
+class LexicalPreparationTests(unittest.TestCase):
+    def record(self, identifier, split="train", command=None, expected=None):
+        row = {
+            "id": identifier,
+            "group": identifier,
+            "split": split,
+            "command": command or f"Explain the concept {identifier}.",
+            "canvas": {},
+            "expected": expected
+            or {
+                "name": "no_action",
+                "arguments": {"reason": "unsupported_request"},
+            },
+        }
+        return row, (json.dumps(row, sort_keys=True) + " \n").encode()
+
+    def test_balanced_replay_is_unique_train_only_and_excludes_development_sentences(
+        self,
+    ):
+        from prepare_modal_training import command_sentence, select_lexical_replay
+
+        actions = (
+            {"name": "no_action", "arguments": {"reason": "missing_target"}},
+            {"name": "canvas_command", "arguments": {"operation": "zoom_in"}},
+            {
+                "name": "canvas_command",
+                "arguments": {"operation": "pan", "dx": 20, "dy": 0},
+            },
+        )
+        records = [
+            self.record(f"train-{action}-{index}", expected=expected)
+            for action, expected in enumerate(actions)
+            for index in range(5)
+        ]
+        forbidden = self.record(
+            "forbidden", command="  Explain the dev topic! ", expected=actions[0]
+        )
+        development = [self.record("dev", "valid", "explain the dev topic.")]
+        selected, summary = select_lexical_replay(
+            [*records, forbidden, *development], development, count=6
+        )
+        repeated, _ = select_lexical_replay(
+            [*records, forbidden, *development], development, count=6
+        )
+        self.assertEqual(selected, repeated)
+        self.assertEqual(len({row["id"] for row, _ in selected}), 6)
+        self.assertEqual(set(summary["stratum_counts"].values()), {2})
+        self.assertTrue(all(row["split"] == "train" for row, _ in selected))
+        self.assertFalse(
+            any(
+                command_sentence(row["command"])
+                == command_sentence(development[0][0]["command"])
+                for row, _ in selected
+            )
+        )
+        only_reserved = [self.record("unavailable", command="Explain the dev topic.")]
+        with self.assertRaisesRegex(ValueError, "every action stratum"):
+            select_lexical_replay(only_reserved, development, count=1)
+
+    def test_plan_has_exact_exposures_interleaving_and_unchanged_index_digest(self):
+        import numpy as np
+
+        from gpu_benchmark import quality_batches
+        from prepare_modal_training import build_lexical_training_plan
+
+        lengths = np.asarray([2 + index % 4 for index in range(2000)])
+        plan, summary = build_lexical_training_plan(lengths)
+        repeated, _ = build_lexical_training_plan(lengths)
+        np.testing.assert_array_equal(plan, repeated)
+        self.assertEqual(plan.shape, (400, 8))
+        counts = np.bincount(plan.ravel(), minlength=2000)
+        np.testing.assert_array_equal(counts[:1200], np.full(1200, 2))
+        np.testing.assert_array_equal(counts[1200:], np.ones(800))
+        blocks = plan.reshape(100, 4, 8)
+        self.assertTrue(np.all(blocks[:, :3] < 1200))
+        self.assertTrue(np.all(blocks[:, 3] >= 1200))
+        self.assertTrue(all(len(set(batch)) == 8 for batch in plan))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            data.mkdir()
+            tokens = data / "tokens-train.npz"
+            samples = [
+                np.full(length, index + 100, np.int32)
+                for index, length in enumerate(lengths)
+            ]
+            np.savez(
+                tokens,
+                tokens=np.concatenate(samples),
+                boundaries=np.cumsum([0, *lengths]),
+                offsets=np.ones(2000, np.int32),
+            )
+            frozen_plan = data / "train-plan.npz"
+            np.savez(frozen_plan, indices=plan)
+            (data / "tokens.json").write_text(
+                json.dumps(
+                    {
+                        "dataset_sha256": "data",
+                        "task_sha256": "task",
+                        "files": {
+                            "train-plan.npz": hashlib.sha256(
+                                frozen_plan.read_bytes()
+                            ).hexdigest()
+                        },
+                    }
+                )
+            )
+            (root / "examples.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            **self.record(f"train-{index}")[0],
+                            "provenance": "lexical" if index < 1200 else "replay",
+                        }
+                    )
+                    + "\n"
+                    for index in range(2000)
+                )
+            )
+            exposure_path = root / "exposure.json"
+            batches, digest = quality_batches(
+                tokens, 999, 0, 400, exposure_path=exposure_path
+            )
+            self.assertEqual(digest, summary["indices_sha256"])
+            np.testing.assert_array_equal(
+                np.asarray([batch[:, 0] - 100 for batch, _ in batches]), plan
+            )
+            exposure = json.loads(exposure_path.read_text())
+            self.assertEqual(exposure["selected_positions"], 3200)
+            self.assertEqual(exposure["unique_examples"], 2000)
+            self.assertEqual(exposure["coverage_fraction"], 1.0)
+            self.assertEqual(
+                exposure["provenance_counts"], {"lexical": 2400, "replay": 800}
+            )
+        with self.assertRaisesRegex(ValueError, "2000 rows"):
+            build_lexical_training_plan(lengths[:-1])
+
+    def test_combining_keeps_every_development_and_test_row_byte_for_byte(self):
+        from prepare_modal_training import combine_lexical_data
+
+        original = [
+            *[self.record(f"old-{index}") for index in range(6)],
+            self.record("original-valid", "valid"),
+            self.record("original-test", "test"),
+        ]
+        supplemental = [
+            self.record("supplement-train"),
+            self.record("supplement-valid", "valid"),
+        ]
+        lexical = [
+            self.record("new-train-a"),
+            self.record("new-train-b"),
+            self.record("new-valid", "valid"),
+        ]
+
+        def case(identifier, split):
+            row = {"id": identifier, "split": split, "initial_canvas": {}, "turns": []}
+            return row, (json.dumps(row) + " \n").encode()
+
+        original_cases = [
+            case("old-practice", "train"),
+            case("original-session", "valid"),
+            case("original-test-session", "test"),
+        ]
+        supplemental_cases = [case("supplement-session", "valid")]
+        lexical_cases = [case("new-practice", "train"), case("new-session", "valid")]
+        rows, lines, cases, replay, _, ledger, _ = combine_lexical_data(
+            original,
+            supplemental,
+            lexical,
+            original_cases,
+            supplemental_cases,
+            lexical_cases,
+            replay_count=2,
+        )
+        expected = [
+            pair
+            for pair in [*original, *supplemental, *lexical]
+            if pair[0]["split"] != "train"
+        ]
+        actual = [
+            (row, raw)
+            for row, raw in zip(rows, lines, strict=True)
+            if row["split"] != "train"
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            cases, [*original_cases[1:], *supplemental_cases, *lexical_cases]
+        )
+        self.assertEqual(len([row for row in rows if row["split"] == "train"]), 4)
+        self.assertEqual(len(replay), 2)
+        self.assertEqual(ledger, [])
+        leaked = self.record("leaked", command=lexical[-1][0]["command"])
+        with self.assertRaisesRegex(ValueError, "development sentences"):
+            combine_lexical_data(
+                original,
+                supplemental,
+                [*lexical, leaked],
+                original_cases,
+                supplemental_cases,
+                lexical_cases,
+                replay_count=2,
+            )
+
+    def test_config_is_conservative_and_preserves_the_original_selection_pool(self):
+        import yaml
+
+        from prepare_modal_training import lexical_training_config, training_config
+
+        examples = [self.record(f"valid-{index}", "valid") for index in range(256)]
+        cases = [
+            ({"id": f"session-{index}", "split": "valid"}, b"") for index in range(6)
+        ]
+        config = {
+            "selection_example_ids": [row["id"] for row, _ in examples],
+            "selection_session_ids": [row["id"] for row, _ in cases],
+            "num_layers": -1,
+            "lora_parameters": {"rank": 32, "dropout": 0.0, "scale": 8.0},
+            "loss_mode": "completion_tokens_v1",
+            "completion_window": 160,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text(yaml.safe_dump(config))
+            refined = lexical_training_config(root, examples, cases)
+            legacy = training_config(root, examples, cases)
+        self.assertEqual(refined["quality_updates"], 400)
+        self.assertEqual(refined["checkpoint_selection_steps"], [400])
+        self.assertEqual(refined["batch_size"], 8)
+        self.assertEqual(refined["refinement_micro_batch"], 2)
+        self.assertEqual(refined["refinement_checkpoint"], "all")
+        self.assertEqual(refined["model_dtype"], "float16")
+        self.assertEqual(refined["completion_window"], 160)
+        self.assertEqual(refined["lr_schedule"]["arguments"], [2e-6, 380, 2e-7])
+        self.assertEqual(refined["lr_schedule"]["warmup"], 20)
+        self.assertEqual(
+            refined["selection_example_ids"], config["selection_example_ids"]
+        )
+        self.assertEqual(
+            refined["selection_session_ids"], config["selection_session_ids"]
+        )
+        self.assertEqual(legacy["quality_updates"], 3900)
+        self.assertEqual(legacy["checkpoint_selection_steps"], [650, 1950, 3900])
+
+    def test_source_freeze_requires_the_committed_head_and_preparation_never_overwrites(
+        self,
+    ):
+        import prepare_modal_training as preparation
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = root / "actions.py"
+            code.write_bytes(b"committed source\n")
+            with (
+                patch.object(preparation, "TRAINING", root),
+                patch.object(preparation, "LEXICAL_SOURCE_NAMES", ("actions.py",)),
+            ):
+                with patch.object(
+                    preparation.subprocess,
+                    "check_output",
+                    side_effect=["commit-id\n", b"committed source\n"],
+                ):
+                    commit, hashes = preparation.committed_training_sources()
+                self.assertEqual(commit, "commit-id")
+                self.assertEqual(
+                    hashes["actions.py"], hashlib.sha256(code.read_bytes()).hexdigest()
+                )
+                code.write_bytes(b"uncommitted source\n")
+                with patch.object(
+                    preparation.subprocess,
+                    "check_output",
+                    side_effect=["commit-id\n", b"committed source\n"],
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, "Commit the final training source"
+                    ):
+                        preparation.committed_training_sources()
+            with self.assertRaises(FileExistsError):
+                preparation.prepare_lexical(root)
+
+
 class ActionValidationTests(unittest.TestCase):
     def test_short_ids_round_trip_to_real_canvas_ids(self):
         canvas = {

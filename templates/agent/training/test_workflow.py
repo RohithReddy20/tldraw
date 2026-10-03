@@ -1071,6 +1071,110 @@ class ModalPipelineTests(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
+    def test_english_development_is_checked_before_any_replacement_or_fresh_test(self):
+        module = self.import_pipeline()
+        for chosen, candidate_state in ((0, 1.0), (400, 0.5)):
+            with (
+                self.subTest(chosen=chosen),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                input_path = root / "input"
+                input_path.mkdir()
+                (input_path / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "configuration": {"checkpoint_selection_steps": [400]},
+                            "refinement_mode": "lexical",
+                        }
+                    )
+                )
+                run = {"run_name": "v9-offline", "billing_baseline_usd": 0}
+                before = {
+                    "document_agreement_rate": 1.0,
+                    "selection_agreement_rate": 1.0,
+                    "camera_agreement_rate": 1.0,
+                }
+                after = {**before, "document_agreement_rate": candidate_state}
+
+                def remote_result(
+                    _run, mode, case, *_args, _before=before, _after=after
+                ):
+                    metrics = _before if case == "baseline" else _after
+                    return SimpleNamespace(
+                        get=Mock(
+                            return_value={
+                                "report": {
+                                    "metrics": metrics if mode == "language" else {}
+                                },
+                                "artifacts": {},
+                                "function_seconds": 0,
+                            }
+                        )
+                    )
+
+                spawn = Mock(side_effect=remote_result)
+                with (
+                    patch.object(module, "HERE", root),
+                    patch.object(module, "INPUT", input_path),
+                    patch.object(module, "run_task", SimpleNamespace(spawn=spawn)),
+                    patch.object(module, "download_artifacts"),
+                    patch.object(module, "billing", side_effect=AssertionError),
+                    patch(
+                        "gpu_benchmark.choose_checkpoint",
+                        return_value={"chosen_step": chosen},
+                    ),
+                    patch("gpu_benchmark.checkpoint_regressions", return_value=[]),
+                    patch.object(module, "print", create=True),
+                ):
+                    module.pipeline(run, module.time.time() + 600)
+                calls = [(item.args[1], item.args[2]) for item in spawn.call_args_list]
+                self.assertEqual(
+                    calls,
+                    [
+                        ("train", "baseline"),
+                        ("selection", "baseline"),
+                        ("selection", "step-400"),
+                        ("language", "baseline"),
+                        ("language", "step-400"),
+                    ],
+                )
+                self.assertEqual(run["status"], "complete_retained_baseline")
+                self.assertFalse(run["promotion_passed"])
+                self.assertFalse(run["test_set_used"])
+                self.assertEqual(run["language_validation"]["baseline"], before)
+                self.assertEqual(
+                    run["language_validation"]["regressions"][400],
+                    ["document_agreement_rate"] if chosen else [],
+                )
+
+    def test_modal_comparison_keeps_retained_baseline_separate_from_warm_start(
+        self,
+    ):
+        import yaml
+
+        import modal_training_worker as worker
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs, output = root / "input", root / "output"
+            inputs.mkdir()
+            (inputs / "config.yaml").write_text(
+                yaml.safe_dump({"checkpoint_selection_steps": [400]})
+            )
+            (inputs / "warm-start.safetensors").write_bytes(b"v8 step1950")
+            (inputs / "baseline.safetensors").write_bytes(b"retained v6")
+            (inputs / "baseline-config.json").write_text('{"source":"retained"}')
+            with patch.object(worker, "ROOT", inputs):
+                folder = worker.adapter_folder(output, "baseline", 0, {})
+            self.assertEqual(
+                (folder / "adapter/adapters.safetensors").read_bytes(), b"retained v6"
+            )
+            self.assertEqual(
+                (folder / "adapter/adapter_config.json").read_text(),
+                '{"source":"retained"}',
+            )
+
     def test_native_report_must_pass_with_matching_weights_before_fresh_testing(self):
         module = self.import_pipeline()
         for status, matching_hash in (

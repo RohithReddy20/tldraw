@@ -41,14 +41,16 @@ def adapter_folder(output, case, step, metadata):
     trained = output / "refinement/dual-window"
     folder = output / "refinement" / case
     config = yaml.safe_load((ROOT / "config.yaml").read_text())
+    baseline = "baseline" if (ROOT / "baseline.safetensors").exists() else "warm-start"
     if not (folder / "adapter/adapters.safetensors").exists():
         if case == "baseline":
             (folder / "adapter").mkdir(parents=True)
             shutil.copyfile(
-                ROOT / "warm-start.safetensors", folder / "adapter/adapters.safetensors"
+                ROOT / f"{baseline}.safetensors",
+                folder / "adapter/adapters.safetensors",
             )
             shutil.copyfile(
-                ROOT / "warm-start-config.json",
+                ROOT / f"{baseline}-config.json",
                 folder / "adapter/adapter_config.json",
             )
             (folder / "config.yaml").write_text(
@@ -59,7 +61,7 @@ def adapter_folder(output, case, step, metadata):
                 raise ValueError("Only frozen selection checkpoints can be exported.")
             export_checkpoint(trained, folder, step, metadata)
     expected = (
-        digest(ROOT / "warm-start.safetensors")
+        digest(ROOT / f"{baseline}.safetensors")
         if case == "baseline"
         else digest(trained / f"adapter/checkpoints/{step:07d}/adapters.safetensors")
     )
@@ -234,6 +236,18 @@ def run(args):
                 if args.mode == "selection":
                     gpu_benchmark.evaluate_checkpoint_selection(folder)
                     result = gpu_benchmark.checkpoint_metrics(folder, selection=True)
+                elif args.mode == "language":
+                    identifiers = manifest["development_pools"].get("lexical")
+                    if manifest.get("refinement_mode") != "lexical" or not identifiers:
+                        raise ValueError(
+                            "English scoring requires a frozen lexical pool."
+                        )
+                    result = score_pool(
+                        folder,
+                        "lexical",
+                        identifiers["example_ids"],
+                        identifiers["session_ids"],
+                    )
                 elif args.mode == "full":
                     result = {
                         pool: score_pool(
@@ -275,7 +289,9 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", choices=("train", "selection", "full", "test"), required=True
+        "--mode",
+        choices=("train", "selection", "language", "full", "test"),
+        required=True,
     )
     parser.add_argument("--case", default="baseline")
     parser.add_argument("--step", type=int, default=0)

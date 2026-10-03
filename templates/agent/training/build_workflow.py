@@ -4914,6 +4914,10 @@ def audit_lexical_tokenization(rows, tokenizer_path):
     }
 
 
+def lexical_command_key(command):
+    return re.sub(r"[.!?]+$", "", " ".join(command.casefold().split())).rstrip()
+
+
 def build_lexical_refinement(
     output,
     *,
@@ -4966,9 +4970,7 @@ def build_lexical_refinement(
         )
     commands = {
         split: {
-            " ".join(row["command"].casefold().split())
-            for row in rows
-            if row["split"] == split
+            lexical_command_key(row["command"]) for row in rows if row["split"] == split
         }
         for split in ("train", "valid")
     }
@@ -5082,6 +5084,9 @@ def build_lexical_refinement(
             "names": LEXICAL_NAMES,
             "train_sentence_slots": [0, 1, 2, 3],
             "development_sentence_slots": [4, 5],
+            "command_surface_normalization": (
+                "Casefold, collapse whitespace and strip terminal .!? punctuation"
+            ),
             "test_use": False,
             "reserved_data": (
                 "Existing development and test files were not read or changed"

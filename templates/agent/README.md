@@ -912,6 +912,29 @@ changes require a new paired evaluation. Billing receipts show approximately
 $5.8 total metered usage across the completed Modal experiments, covered by
 credits with zero cash charges at the recorded check.
 
+The ordinary-English correction run uses `prepare_modal_training.py
+--lexical-refinement`. Its 400-update plan exposes all 1,200 new training rows
+twice and 800 balanced, distinct replay rows once. It starts from version-eight
+update 1,950 with a 2e-6 learning rate; the comparison baseline remains version
+six, frozen in separate files. Original and supplemental development/test bytes
+remain unchanged. The new English development pool is scored separately even
+when the original selection gate rejects the candidate, and can also reject a
+replacement. Full original, supplement, and English development gates and native
+checks still precede any fresh test scoring.
+
+```sh
+uv run --project templates/agent/training python templates/agent/training/prepare_modal_training.py --lexical-refinement
+CANVAS_MODAL_RUN_DIRECTORY=templates/agent/training/runs/v9-english-modal \
+CANVAS_MODAL_RUN_PREFIX=v9 \
+CANVAS_MODAL_BILLING_BASELINE=templates/agent/training/runs/v8-quality-modal/profile/billing-before.json \
+uv run --no-project --isolated --with modal==1.6.0 python templates/agent/training/modal_training.py
+```
+
+This invocation shares the earlier $8 allowance and billing baseline. It uses a
+separate immutable input and cloud run name, with one GPU container and the same
+deadline, usage monitor, checkpoint, and stop controls. Training and evaluation
+run on Modal; local preparation only audits and tokenizes data on CPU.
+
 #### Accuracy trial for the faster trainer
 
 Notebook version 6 resumed the same retained update-5,000 adapter and optimizer
