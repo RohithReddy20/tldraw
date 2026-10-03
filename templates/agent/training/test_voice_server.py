@@ -57,6 +57,96 @@ class VoiceGuardTests(unittest.TestCase):
             {"name": "no_action", "arguments": {"reason": "unsupported_request"}},
         )
 
+    def test_quoted_payloads_are_single_edits_and_cannot_hide_a_second_edit(self):
+        self.canvas["schemas"][1]["name"] = "Account"
+        action = {
+            "name": "set_text",
+            "arguments": {"shape_id": "first", "text": "Save and delete"},
+        }
+        for quote in ('"Save and delete"', "'Save and delete'", "“Save and delete”"):
+            command = f'Set the text of "User" to {quote}.'
+            with self.subTest(quote=quote):
+                self.assertEqual(
+                    execution_guard(command, action, self.canvas, {}), action
+                )
+                self.assertEqual(
+                    execution_guard(
+                        command + " And then move it right.", action, self.canvas, {}
+                    ),
+                    {
+                        "name": "no_action",
+                        "arguments": {"reason": "unsupported_request"},
+                    },
+                )
+        for literal in ('"No, cancel that; move and delete"', '"I mean and move"'):
+            with self.subTest(literal=literal):
+                self.assertEqual(
+                    execution_guard(
+                        f"Set its text to {literal} and delete it.",
+                        action,
+                        self.canvas,
+                        {},
+                    ),
+                    {
+                        "name": "no_action",
+                        "arguments": {"reason": "unsupported_request"},
+                    },
+                )
+        for literal in (
+            '"last created shape"',
+            '"on the selected shape"',
+            '"Say \\"and delete\\" safely"',
+        ):
+            with self.subTest(literal=literal):
+                self.assertEqual(
+                    execution_guard(
+                        f'Set the text of "User" to {literal}.',
+                        action,
+                        {**self.canvas, "selected_ids": []},
+                        {},
+                    ),
+                    action,
+                )
+
+    def test_explicit_correction_checks_only_the_final_requested_edit(self):
+        action = {
+            "name": "move_shapes",
+            "arguments": {"shape_ids": ["first"], "dx": 25, "dy": 0},
+        }
+        for correction in (
+            "No, cancel that;",
+            "No, instead",
+            "No, actually",
+            "I mean",
+            "Scratch that;",
+            "Forget that.",
+            "Wait, cancel that and",
+            "Actually, cancel that and",
+        ):
+            command = (
+                f"Delete the last created box and then draw a note. {correction} "
+                "move it right by 25."
+            )
+            with self.subTest(correction=correction):
+                self.assertEqual(
+                    execution_guard(command, action, self.canvas, {}), action
+                )
+                self.assertEqual(
+                    execution_guard(
+                        command + " And rename it Account.", action, self.canvas, {}
+                    ),
+                    {
+                        "name": "no_action",
+                        "arguments": {"reason": "unsupported_request"},
+                    },
+                )
+        self.assertEqual(
+            execution_guard(
+                "Move it right by 25. No, cancel that.", action, self.canvas, {}
+            ),
+            {"name": "no_action", "arguments": {"reason": "unsupported_request"}},
+        )
+
     def test_rejected_request_keeps_its_reason_when_history_target_is_absent(self):
         action = {"name": "no_action", "arguments": {"reason": "unsupported_request"}}
         for kind in ("created", "edited"):

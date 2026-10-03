@@ -568,20 +568,40 @@ def no_action(reason):
 
 
 def execution_guard(command, action, canvas, history):
+    # Captions and cancelled requests must not become edits or history references.
+    syntax = re.sub(
+        r'"(?:\\.|[^"\\])*"|“[^”]*”|(?<!\w)\'(?:\\.|[^\'\\])*\'(?!\w)',
+        lambda match: " " * len(match.group()),
+        command,
+    )
+    corrections = list(
+        re.finditer(
+            r"\b(?:(?:no\s*,?\s*instead|i mean|(?:(?:no|wait|actually)\s*,?\s*)?"
+            r"(?:cancel that|scratch that|forget that))\b|(?:no|actually)\s*,)"
+            r"[\s,;:.!?]*(?:and\b\s*)?",
+            syntax,
+            re.I,
+        )
+    )
+    if corrections:
+        start = corrections[-1].end()
+        command, syntax = command[start:], syntax[start:]
+        if not command.strip():
+            return no_action("unsupported_request")
     if re.search(
         r"\band\s+(?:then\s+)?(?:move|rotate|color|delete|rename|connect|add|remove|create|draw|resize|group|ungroup|duplicate|undo|redo)\b",
-        command,
+        syntax,
         re.I,
     ):
         # Method lists can contain conjunctions without requesting another edit.
         if not (
             action["name"] == "create_schema_box"
-            and re.search(r"\b(?:properties|fields|methods|functions)\b", command, re.I)
+            and re.search(r"\b(?:properties|fields|methods|functions)\b", syntax, re.I)
         ):
             return no_action("unsupported_request")
         if re.search(
             r"\band\s+(?:then\s+)?(?:move|rotate|color|delete|rename|connect)\b",
-            command,
+            syntax,
             re.I,
         ):
             return no_action("unsupported_request")
@@ -594,7 +614,7 @@ def execution_guard(command, action, canvas, history):
         re.search(
             r"\b(?:to|from|on|in|of|rename|call|update)\s+(?:the\s+)?"
             r"selected (?:box|schema|class|shape|rectangle|circle|text|note)\b",
-            command,
+            syntax,
             re.I,
         )
         and len(canvas.get("selected_ids", [])) != 1
@@ -608,7 +628,7 @@ def execution_guard(command, action, canvas, history):
         ("edited", r"\b(?:last edited|(?:schema|class|box) we (?:last )?edited)\b"),
     ):
         if (
-            re.search(expression, command, re.I)
+            re.search(expression, syntax, re.I)
             and history.get(f"last_{kind}_id") not in schemas
         ):
             return no_action("missing_target")
