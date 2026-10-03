@@ -207,6 +207,18 @@ candidate replaces the baseline after an observed action or state regression.
 Fresh tests run only after that gate and native integration checks pass. State
 reports now separate document, selection, and camera agreement.
 
+The private Kaggle job
+[`rohithresearch/canvas-270m-v7-accuracy-refinement`](https://www.kaggle.com/code/rohithresearch/canvas-270m-v7-accuracy-refinement)
+is running from source commit `2d383d112`. The frozen corpus and sources are under
+`training/runs/v7-accuracy-workflow-revised/`; launch metadata and live logs are
+under `training/runs/kaggle/accuracy/`. Preflight passed 73 Python tests, the
+function-call token round trips, and a sampler check showing all 24,000 unique
+rows selected exactly once. The longest input is 4,242 tokens and response is 68.
+The monitor uses the frozen source, prevents idle sleep, retrieves and verifies
+checkpoints, runs both native model integration tests, and starts final scoring
+only after validation and native checks pass. Desktop completion notifications
+are configured. New model accuracy remains unmeasured until these jobs finish.
+
 The workflow follows Google's [FunctionGemma fine-tuning guidance](https://ai.google.dev/gemma/docs/functiongemma/finetuning-with-functiongemma).
 The [APIGen paper](https://arxiv.org/abs/2406.18518) provides a reference for checking
 function-call data through format, execution, and semantic validation. The checks
