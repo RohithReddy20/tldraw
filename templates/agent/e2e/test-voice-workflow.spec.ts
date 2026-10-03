@@ -245,6 +245,66 @@ test('captures a manual drag before the next voice edit', async ({ page }) => {
 	expect(result.current).toMatchObject({ x: 125, y: 110 })
 })
 
+test('matches quality-data assumptions for native notes, frames and grouped targets', async ({
+	page,
+}) => {
+	const result = await page.evaluate(() => {
+		const act = (name: string, args: unknown) =>
+			voice.execute(editor, { name, arguments: args }, voice.context(editor))
+		const note = act('create_shape', {
+			kind: 'note',
+			text: 'Reminder',
+			x: 0,
+			y: 0,
+			width: 120,
+			height: 80,
+		}).createdId!
+		const frame = act('create_shape', {
+			kind: 'frame',
+			text: 'Section',
+			x: 400,
+			y: 0,
+			width: 300,
+			height: 180,
+		}).createdId!
+		const a = act('create_shape', {
+			kind: 'rectangle',
+			text: 'Packing card',
+			x: 900,
+			y: 0,
+		}).createdId!
+		const b = act('create_shape', {
+			kind: 'rectangle',
+			text: 'Route tile',
+			x: 1200,
+			y: 0,
+		}).createdId!
+		const group = act('arrange_shapes', { shape_ids: [a, b], operation: 'group' }).createdId!
+		const before = voice.context(editor)
+		act('select_shapes', { shape_ids: [b] })
+		act('move_shapes', { shape_ids: [a], dx: 25, dy: 0 })
+		const after = voice.context(editor)
+		return {
+			note: after.shapes.find((s) => s.id === note),
+			frame: after.shapes.find((s) => s.id === frame),
+			childParent: after.shapes.find((s) => s.id === a)!.parent_id === group,
+			childDistance:
+				after.shapes.find((s) => s.id === a)!.x - before.shapes.find((s) => s.id === a)!.x,
+			otherDistance:
+				after.shapes.find((s) => s.id === b)!.x - before.shapes.find((s) => s.id === b)!.x,
+			selectedTarget: after.selected_ids.length === 1 && after.selected_ids[0] === a,
+		}
+	})
+	expect(result.note).toMatchObject({ kind: 'note', w: 200, h: 200 })
+	expect(result.frame).toMatchObject({ kind: 'frame', color: 'black', fill: 'none' })
+	expect(result).toMatchObject({
+		childParent: true,
+		childDistance: 25,
+		otherDistance: 0,
+		selectedTarget: true,
+	})
+})
+
 test.describe('model integration', () => {
 	test.skip(!process.env.VOICE_MODEL_URL, 'Requires a running local action model.')
 	test.setTimeout(180_000)

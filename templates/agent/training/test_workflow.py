@@ -19,13 +19,18 @@ from actions import (
     validate_call,
 )
 from build_workflow import (
+    QUALITY_PAIRS,
     accuracy_example,
     accuracy_fingerprint,
     accuracy_quotas,
+    audit_quality_supplement,
     build_accuracy_refinement,
+    build_quality_supplement,
     build_spoken_refinement,
     build_workflow,
     call,
+    quality_pair,
+    quality_session,
 )
 from dataset import audit_examples, training_row
 from sessions import CanvasSession
@@ -169,6 +174,279 @@ class AccuracyDataTests(unittest.TestCase):
                 build_accuracy_refinement(source, output, count=49)
             with self.assertRaises(FileExistsError):
                 build_accuracy_refinement(source, output, count=48)
+
+
+class QualitySupplementTests(unittest.TestCase):
+    def pair(self, family, *, split="train", seed=72):
+        return quality_pair(random.Random(seed), split, 17, family)
+
+    def test_pan_and_shape_movement_have_the_same_context_and_different_targets(self):
+        rows, receipts, pair = self.pair("pan_move")
+        self.assertTrue(pair["same_canvas_and_history"])
+        pan, move = (row["expected"] for row in rows)
+        self.assertEqual(pan["name"], "pan_canvas")
+        self.assertEqual(move["name"], "move_shapes")
+        self.assertEqual(pan["arguments"]["dx"], move["arguments"]["dx"])
+        self.assertEqual(pan["arguments"]["dy"], 0)
+        self.assertEqual(len(move["arguments"]["shape_ids"]), 1)
+        audit = audit_quality_supplement(rows, [], receipts, [pair])
+        self.assertEqual(audit["independent_replay_inputs"], 2)
+
+    def test_undo_redo_without_history_are_missing_instead_of_unsupported(self):
+        for operation in ("undo", "redo"):
+            with self.subTest(operation=operation):
+                rows, receipts, pair = self.pair(operation)
+                available, absent = rows
+                self.assertEqual(available["command"], absent["command"])
+                self.assertTrue(available["canvas"][f"can_{operation}"])
+                self.assertFalse(absent["canvas"][f"can_{operation}"])
+                self.assertEqual(
+                    available["expected"], call("canvas_command", operation=operation)
+                )
+                self.assertEqual(
+                    absent["expected"], call("no_action", reason="missing_target")
+                )
+                audit_quality_supplement(rows, [], receipts, [pair])
+
+    def test_zoom_out_in_pair_keeps_context_and_changes_camera_scale(self):
+        rows, receipts, pair = self.pair("zoom_out_in")
+        self.assertTrue(pair["same_canvas_and_history"])
+        for row, operation, scale in zip(
+            rows, ("zoom_out", "zoom_in"), (0.5, 2), strict=True
+        ):
+            self.assertEqual(
+                row["expected"], call("canvas_command", operation=operation)
+            )
+            session = CanvasSession(row["canvas"])
+            before = session.canvas["camera"]["z"]
+            session.execute(row["command"], row["expected"], "zoom-proof")
+            self.assertEqual(session.canvas["camera"]["z"], before * scale)
+        audit_quality_supplement(rows, [], receipts, [pair])
+
+    def test_mixed_group_refusal_and_direct_geochild_style_have_the_same_context(self):
+        rows, receipts, pair = self.pair("mixed_group_child_style")
+        self.assertTrue(pair["same_model_canvas_and_history"])
+        self.assertEqual(
+            rows[0]["expected"], call("no_action", reason="unsupported_request")
+        )
+        child = rows[1]["expected"]["arguments"]["shape_ids"][0]
+        session = CanvasSession(rows[1]["canvas"])
+        parent = session.objects()[child]["parent_id"]
+        self.assertIsNotNone(parent)
+        leaves = session.style_targets([parent])
+        self.assertEqual({shape["kind"] for shape in leaves}, {"frame", "rectangle"})
+        before = copy.deepcopy(session.objects())
+        session.execute(rows[1]["command"], rows[1]["expected"], "style-proof")
+        self.assertEqual(session.objects()[child]["color"], "blue")
+        self.assertTrue(
+            all(
+                shape == before[identifier]
+                for identifier, shape in session.objects().items()
+                if identifier != child
+            )
+        )
+        audit_quality_supplement(rows, [], receipts, [pair])
+
+    def test_generic_creation_covers_every_supported_kind_and_preserves_api_defaults(
+        self,
+    ):
+        seen = set()
+        for cycle in range(8):
+            rows, receipts, pair = quality_pair(
+                random.Random(72 + cycle),
+                "train",
+                cycle * len(QUALITY_PAIRS),
+                "drawing_kind",
+            )
+            self.assertTrue(pair["same_canvas_and_history"])
+            self.assertNotEqual(
+                rows[0]["expected"]["arguments"]["kind"],
+                rows[1]["expected"]["arguments"]["kind"],
+            )
+            for row in rows:
+                arguments = row["expected"]["arguments"]
+                seen.add(arguments["kind"])
+                self.assertEqual(arguments["width"], 160)
+                self.assertEqual(arguments["height"], 100)
+                self.assertIsNone(arguments["x"])
+                self.assertIsNone(arguments["y"])
+                self.assertIn(json.dumps(arguments["text"]), row["command"])
+                self.assertNotRegex(row["command"], r"\b(?:width|height|units)\b")
+            audit_quality_supplement(rows, [], receipts, [pair])
+        supported = ACTION_MODELS["create_shape"][0].model_json_schema()["properties"][
+            "kind"
+        ]["enum"]
+        self.assertEqual(seen, set(supported))
+
+    def test_stale_and_rejected_names_follow_actual_outcomes(self):
+        renamed, _, _ = self.pair("stale_name")
+        failed, receipts, pair = self.pair("rejected_rename")
+        self.assertEqual(
+            renamed[0]["expected"], call("no_action", reason="missing_target")
+        )
+        self.assertEqual(renamed[1]["expected"]["name"], "rename_schema")
+        self.assertEqual(failed[0]["expected"]["name"], "add_property")
+        self.assertEqual(
+            failed[1]["expected"], call("no_action", reason="missing_target")
+        )
+        self.assertIsNone(failed[0]["history"]["turns"][-1]["action"])
+        self.assertEqual(
+            failed[0]["canvas"]["schemas"][0]["name"],
+            receipts[0]["initial_canvas"]["schemas"][0]["name"],
+        )
+        audit_quality_supplement(failed, [], receipts, [pair])
+
+    def test_counterfactual_recovery_uses_the_executed_wrong_action(self):
+        rows, receipts, pair = self.pair("wrong_target_recovery")
+        recorded = rows[0]["history"]["turns"][-1]
+        actual_target = recorded["action"]["arguments"]["shape_ids"][0]
+        requested_target = rows[0]["expected"]["arguments"]["shape_ids"][0]
+        self.assertNotEqual(actual_target, requested_target)
+        initial = {
+            shape["id"]: shape for shape in receipts[0]["initial_canvas"]["shapes"]
+        }
+        current = {shape["id"]: shape for shape in rows[0]["canvas"]["shapes"]}
+        self.assertEqual(
+            current[actual_target]["x"] - initial[actual_target]["x"],
+            recorded["action"]["arguments"]["dx"],
+        )
+        self.assertEqual(current[requested_target]["x"], initial[requested_target]["x"])
+        self.assertEqual(rows[1]["expected"], call("canvas_command", operation="undo"))
+        audit_quality_supplement(rows, [], receipts, [pair])
+
+    def test_real_corrections_cancel_an_edit_and_literal_payloads_stay_literal(self):
+        correction, _, _ = self.pair("target_correction")
+        self.assertEqual(correction[0]["expected"]["name"], "move_shapes")
+        self.assertEqual(
+            correction[1]["expected"], call("no_action", reason="unsupported_request")
+        )
+        self.assertEqual(
+            correction[0]["expected"]["arguments"]["shape_ids"],
+            correction[0]["canvas"]["selected_ids"],
+        )
+        self.assertGreaterEqual(correction[0]["command"].count("right"), 2)
+        literal, _, _ = self.pair("literal_conjunction")
+        self.assertIn(" and ", literal[0]["expected"]["arguments"]["text"])
+        self.assertEqual(literal[0]["expected"]["name"], "set_text")
+        self.assertEqual(
+            literal[1]["expected"], call("no_action", reason="unsupported_request")
+        )
+
+    def test_native_capability_contrasts_use_reachable_default_shapes(self):
+        rows, receipts, pair = self.pair("text_uniform_resize")
+        action = rows[0]["expected"]
+        target = next(
+            shape
+            for shape in rows[0]["canvas"]["shapes"]
+            if shape["id"] == action["arguments"]["shape_id"]
+        )
+        self.assertEqual(
+            action["arguments"]["width"] * target["h"],
+            action["arguments"]["height"] * target["w"],
+        )
+        self.assertEqual(
+            rows[1]["expected"], call("no_action", reason="unsupported_request")
+        )
+        note = next(
+            shape for shape in rows[0]["canvas"]["shapes"] if shape["kind"] == "note"
+        )
+        frame = next(
+            shape for shape in rows[0]["canvas"]["shapes"] if shape["kind"] == "frame"
+        )
+        self.assertEqual((note["w"], note["h"]), (200, 200))
+        self.assertEqual(frame["color"], "black")
+        audit_quality_supplement(rows, [], receipts, [pair])
+
+    def test_long_session_refines_created_objects_and_replays_manual_edits(self):
+        rows, case = quality_session(random.Random(72), "train", 0)
+        self.assertEqual(len(rows), 72)
+        for start in (0, 36):
+            created = f"{case['id']}:created-{start}"
+            self.assertEqual(rows[start]["expected"]["name"], "create_shape")
+            self.assertEqual(
+                rows[start + 1]["expected"]["arguments"]["shape_ids"], [created]
+            )
+            self.assertEqual(
+                rows[start + 2]["expected"]["arguments"]["shape_id"], created
+            )
+            self.assertEqual(
+                rows[start + 3]["expected"]["arguments"]["shape_id"], created
+            )
+            self.assertEqual(
+                rows[start + 5]["expected"]["arguments"]["shape_ids"], [created]
+            )
+            self.assertNotEqual(rows[start + 5]["canvas"]["selected_ids"], [created])
+            self.assertEqual(
+                rows[start + 19]["expected"], call("no_action", reason="missing_target")
+            )
+            self.assertEqual(
+                rows[start + 30]["expected"], call("no_action", reason="missing_target")
+            )
+        audit = audit_quality_supplement(rows, [case], [], [])
+        self.assertEqual(audit["session_replay_turns"], {"train": 72})
+        broken = copy.deepcopy(case)
+        broken["turns"][29]["before"][0]["text"] = "Different manual label"
+        with self.assertRaisesRegex(ValueError, "replay differs"):
+            audit_quality_supplement(rows, [broken], [], [])
+
+    def test_supplement_is_deterministic_separate_development_and_never_overwrites(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory, patch("builtins.print"):
+            root = Path(directory)
+            outputs = [root / "first", root / "second"]
+            families = len(QUALITY_PAIRS)
+            summaries = [
+                build_quality_supplement(
+                    output,
+                    train_pairs=families,
+                    dev_pairs=families,
+                    train_sessions=1,
+                    dev_sessions=1,
+                )
+                for output in outputs
+            ]
+            self.assertEqual(
+                summaries[0]["splits"],
+                {"train": 2 * families + 72, "valid": 2 * families + 72},
+            )
+            self.assertEqual(
+                summaries[0]["contrastive_pairs"],
+                {"train": families, "valid": families},
+            )
+            self.assertEqual(
+                summaries[0]["artifact_sha256"], summaries[1]["artifact_sha256"]
+            )
+            self.assertEqual(
+                set(summaries[0]["pair_scenarios"]["train"]), set(QUALITY_PAIRS)
+            )
+            self.assertFalse((outputs[0] / "reserved-test-examples.jsonl").exists())
+            rows = [
+                json.loads(line)
+                for line in (outputs[0] / "examples.jsonl").read_text().splitlines()
+            ]
+            train_wording = {
+                row["wording_family"] for row in rows if row["split"] == "train"
+            }
+            valid_wording = {
+                row["wording_family"] for row in rows if row["split"] == "valid"
+            }
+            self.assertFalse(train_wording & valid_wording)
+            self.assertEqual(
+                len({accuracy_fingerprint(row) for row in rows}), len(rows)
+            )
+            with self.assertRaises(FileExistsError):
+                build_quality_supplement(
+                    outputs[0],
+                    train_pairs=families,
+                    dev_pairs=families,
+                    train_sessions=1,
+                    dev_sessions=1,
+                )
+            duplicate = copy.deepcopy(rows[0])
+            duplicate["id"] += ":duplicate"
+            with self.assertRaisesRegex(ValueError, "duplicate full model inputs"):
+                audit_quality_supplement([*rows, duplicate], [], [], [])
 
 
 class CheckpointSelectionRecoveryTests(unittest.TestCase):

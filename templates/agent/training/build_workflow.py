@@ -12,12 +12,14 @@ from actions import (
     Canvas,
     CanvasShape,
     SchemaBox,
+    execution_guard,
     messages_for,
+    model_call,
     no_action,
     validate_call,
 )
 from dataset import audit_examples, iter_examples, read_examples
-from sessions import CanvasSession, supports_style
+from sessions import SIMULATOR_VERSION, CanvasSession, supports_style
 
 NAMES = {
     "train": [
@@ -2390,11 +2392,1579 @@ def build_accuracy_refinement(
     return summary
 
 
+QUALITY_NAMES = {
+    "train": (
+        "Trip plan",
+        "Passenger record",
+        "Packing card",
+        "Route tile",
+        "Gate label",
+        "Ticket note",
+        "Departure frame",
+    ),
+    "valid": (
+        "Studio schedule",
+        "Supply record",
+        "Exhibit card",
+        "Outline tile",
+        "Gallery label",
+        "Artist note",
+        "Opening frame",
+    ),
+}
+
+# Each final pair is a separate development sentence construction.
+QUALITY_PAIRS = {
+    "named_selection": [
+        (
+            "Move {name} right {distance} units.",
+            "Move the selected shape right {distance} units.",
+        ),
+        (
+            "Could you drag {name} to the right by {distance}?",
+            "Could you drag this selected shape to the right by {distance}?",
+        ),
+        (
+            "Um, shift {name} horizontally {distance} units right.",
+            "Um, shift it horizontally {distance} units right.",
+        ),
+        (
+            "Reposition the object labelled {name} {distance} units to the right.",
+            "Reposition the current selection {distance} units to the right.",
+        ),
+    ],
+    "duplicate_name": [
+        (
+            "Move {name} down {distance} units.",
+            "Move the selected shape down {distance} units.",
+        ),
+        (
+            "Please drag the shape named {name} down by {distance}.",
+            "Please drag this selected one down by {distance}.",
+        ),
+        (
+            "Uh, shift {name} vertically {distance} units down.",
+            "Uh, shift it vertically {distance} units down.",
+        ),
+        (
+            "Reposition the object labelled {name} {distance} units lower.",
+            "Reposition the chosen object {distance} units lower.",
+        ),
+    ],
+    "stale_name": [
+        ("Rename schema {schema} to {final}.", "Rename schema {renamed} to {final}."),
+        ("Call the {schema} schema {final}.", "Call the {renamed} schema {final}."),
+        (
+            "Can you change the name of schema {schema} to {final}?",
+            "Can you change the name of schema {renamed} to {final}?",
+        ),
+        (
+            "Replace the title on schema {schema} with {final}.",
+            "Replace the title on schema {renamed} with {final}.",
+        ),
+    ],
+    "deleted_name": [
+        ("Move {name} left {distance} units.", "Move {other} left {distance} units."),
+        (
+            "Drag {name} to the left by {distance}.",
+            "Drag {other} to the left by {distance}.",
+        ),
+        (
+            "Could you shift {name} horizontally {distance} units left?",
+            "Could you shift {other} horizontally {distance} units left?",
+        ),
+        (
+            "Reposition the item labelled {name} {distance} units leftward.",
+            "Reposition the item labelled {other} {distance} units leftward.",
+        ),
+    ],
+    "empty_selection": [
+        (
+            "Change the selected shape's text to {payload}.",
+            "Change the selected shape's text to {payload}.",
+        ),
+        (
+            "Can you put {payload} on the selected shape?",
+            "Can you put {payload} on the selected shape?",
+        ),
+        (
+            "Uh, replace the words on it with {payload}.",
+            "Uh, replace the words on it with {payload}.",
+        ),
+        (
+            "Give the currently chosen object the text {payload}.",
+            "Give the currently chosen object the text {payload}.",
+        ),
+    ],
+    "plural_selection": [
+        (
+            "Move it right {distance} units.",
+            "Move all selected shapes right {distance} units.",
+        ),
+        (
+            "Drag this shape right by {distance}.",
+            "Drag these selected shapes right by {distance}.",
+        ),
+        (
+            "Could you shift the selected shape right {distance} units?",
+            "Could you shift the whole selection right {distance} units?",
+        ),
+        (
+            "Reposition that selected object {distance} units rightward.",
+            "Reposition both chosen objects {distance} units rightward.",
+        ),
+    ],
+    "deleted_last_created": [
+        (
+            "Move the last created shape right {distance} units.",
+            "Move the last created shape right {distance} units.",
+        ),
+        (
+            "Could you drag the last created shape right by {distance}?",
+            "Could you drag the last created shape right by {distance}?",
+        ),
+        (
+            "Um, shift the last created shape {distance} units right.",
+            "Um, shift the last created shape {distance} units right.",
+        ),
+        (
+            "Reposition the last created shape {distance} units to the right.",
+            "Reposition the last created shape {distance} units to the right.",
+        ),
+    ],
+    "last_edited": [
+        ("Make the last edited shape blue.", "Make the selected shape blue."),
+        (
+            "Color the last edited shape blue, please.",
+            "Color this selected shape blue, please.",
+        ),
+        (
+            "Could you give the last edited shape a blue outline?",
+            "Could you give the selected shape a blue outline?",
+        ),
+        (
+            "Set the color of the last edited object to blue.",
+            "Set the color of the chosen object to blue.",
+        ),
+    ],
+    "missing_field": [
+        (
+            "Remove field {absent_field} from schema {schema}.",
+            "Remove field name from schema {schema}.",
+        ),
+        (
+            "Delete the {absent_field} property on {schema}.",
+            "Delete the name property on {schema}.",
+        ),
+        (
+            "Can you take {absent_field} out of schema {schema}'s fields?",
+            "Can you take name out of schema {schema}'s fields?",
+        ),
+        (
+            "Drop property {absent_field} from the {schema} class.",
+            "Drop property name from the {schema} class.",
+        ),
+    ],
+    "missing_method": [
+        (
+            "Remove function {absent_method} from schema {schema}.",
+            "Remove function getName from schema {schema}.",
+        ),
+        (
+            "Delete method {absent_method} on {schema}.",
+            "Delete method getName on {schema}.",
+        ),
+        (
+            "Could you take {absent_method} out of schema {schema}'s functions?",
+            "Could you take getName out of schema {schema}'s functions?",
+        ),
+        (
+            "Drop the {absent_method} operation from {schema}.",
+            "Drop the getName operation from {schema}.",
+        ),
+    ],
+    "target_correction": [
+        (
+            "Move {name} right {distance}; no, "
+            "move {other} right {distance} units instead.",
+            "Move {name} right {distance} units "
+            "and then move {other} right {distance} units.",
+        ),
+        (
+            "Drag {name} right {distance} units. Wait, cancel that; "
+            "drag {other} right {distance} units.",
+            "Drag {name} right {distance} units "
+            "and then move {other} right {distance} units.",
+        ),
+        (
+            "Shift {name} right {distance} units; actually, "
+            "only move {other} right {distance} units.",
+            "Shift {name} right {distance} units "
+            "and move {other} right {distance} units as well.",
+        ),
+        (
+            "Reposition {name} right by {distance}. "
+            "Scratch that: reposition {other} right by {distance}.",
+            "Reposition {name} right by {distance}, "
+            "then move {other} right by {distance}.",
+        ),
+    ],
+    "direction_correction": [
+        (
+            "Move {name} left 100 units; no, right {distance} units instead.",
+            "Move {name} left 100 units and then move it right {distance} units.",
+        ),
+        (
+            "Drag {name} down 100 units. Wait, only move it right {distance} units.",
+            "Drag {name} down 100 units and then move it right {distance} units.",
+        ),
+        (
+            "Shift {name} left 100 units; actually, cancel that "
+            "and move it right {distance} units.",
+            "Shift {name} left 100 units and move it right {distance} units too.",
+        ),
+        (
+            "Reposition {name} leftward by 100. "
+            "Scratch that; rightward by {distance} only.",
+            "Reposition {name} leftward by 100, then move it rightward by {distance}.",
+        ),
+    ],
+    "cancel": [
+        ("Delete {name}. Wait, cancel that; do nothing.", "Delete {name}."),
+        ("Remove {name}; no, leave it as it is.", "Remove {name}, please."),
+        (
+            "Could you erase {name}? Actually, never mind, cancel the request.",
+            "Could you erase {name}?",
+        ),
+        (
+            "Get rid of {name}. Scratch that; leave the canvas unchanged.",
+            "Get rid of {name}.",
+        ),
+    ],
+    "literal_conjunction": [
+        (
+            "Set the text of {name} to {literal}.",
+            "Set the text of {name} to {payload} and delete {other}.",
+        ),
+        (
+            "Replace the words on {name} with the exact text {literal}.",
+            "Replace the words on {name} with {payload} and then delete {other}.",
+        ),
+        (
+            "Could you write {literal} inside {name}?",
+            "Could you write {payload} inside {name} and delete {other}?",
+        ),
+        (
+            "Give {name} this literal label: {literal}.",
+            "Give {name} the label {payload}, then delete {other}.",
+        ),
+    ],
+    "pan_move": [
+        (
+            "Pan the canvas right {distance} units.",
+            "Move {name} right {distance} units.",
+        ),
+        (
+            "Slide the viewport to the right by {distance}.",
+            "Slide the shape named {name} to the right by {distance}.",
+        ),
+        (
+            "Um, shift the camera horizontally {distance} units right.",
+            "Um, shift {name} horizontally {distance} units right.",
+        ),
+        (
+            "Move the view {distance} page units rightward.",
+            "Reposition the object {name} {distance} page units rightward.",
+        ),
+    ],
+    "pan_zoom": [
+        ("Pan the viewport down {distance} units.", "Zoom to fit all shapes."),
+        (
+            "Move the camera down by {distance} page units.",
+            "Fit the whole drawing in the view.",
+        ),
+        (
+            "Can you scroll the canvas down {distance} units?",
+            "Can you zoom to fit the entire diagram?",
+        ),
+        (
+            "Shift the view {distance} units downward.",
+            "Frame every object in the viewport.",
+        ),
+    ],
+    "zoom_opacity": [
+        ("Set zoom to 100 percent.", "Set the opacity of {name} to 100 percent."),
+        ("Reset the canvas zoom to 100%.", "Make {name} fully opaque."),
+        (
+            "Could you return the view to one-to-one zoom?",
+            "Could you set {name}'s opacity to one?",
+        ),
+        (
+            "Restore a zoom factor of one for the camera.",
+            "Restore full opacity for {name}.",
+        ),
+    ],
+    "clear_delete": [
+        ("Clear the selection.", "Delete all selected shapes."),
+        ("Deselect everything.", "Erase everything selected."),
+        ("Can you unselect these shapes?", "Can you remove these selected shapes?"),
+        ("Release the current selection.", "Get rid of the currently chosen objects."),
+    ],
+    "undo": [
+        ("Undo that last edit.", "Undo that last edit."),
+        ("Can you undo the previous change?", "Can you undo the previous change?"),
+        ("Uh, undo.", "Uh, undo."),
+        ("Revert the latest canvas edit.", "Revert the latest canvas edit."),
+    ],
+    "redo": [
+        ("Redo the last undone edit.", "Redo the last undone edit."),
+        ("Can you redo that change?", "Can you redo that change?"),
+        ("Uh, redo.", "Uh, redo."),
+        (
+            "Reapply the most recently undone canvas edit.",
+            "Reapply the most recently undone canvas edit.",
+        ),
+    ],
+    "note_resize": [
+        ("Resize {note} to 240 by 150.", "Resize {name} to 240 by 150."),
+        (
+            "Make {note} 240 units wide and 150 units tall.",
+            "Make {name} 240 units wide and 150 units tall.",
+        ),
+        (
+            "Could you set the dimensions of {note} to 240 by 150?",
+            "Could you set the dimensions of {name} to 240 by 150?",
+        ),
+        (
+            "Give {note} a width of 240 and height of 150.",
+            "Give {name} a width of 240 and height of 150.",
+        ),
+    ],
+    "text_fill": [
+        ("Set the fill of {text} to solid.", "Set the fill of {name} to solid."),
+        ("Give {text} a solid fill.", "Give {name} a solid fill."),
+        (
+            "Could you apply solid fill to {text}?",
+            "Could you apply solid fill to {name}?",
+        ),
+        ("Use a solid interior on {text}.", "Use a solid interior on {name}."),
+    ],
+    "frame_color": [
+        ("Make {frame} blue.", "Set {frame}'s opacity to 50 percent."),
+        ("Set the color of {frame} to blue.", "Make {frame} half opaque."),
+        (
+            "Could you give {frame} a blue outline?",
+            "Could you set {frame}'s opacity to 0.5?",
+        ),
+        (
+            "Apply blue as the color of {frame}.",
+            "Apply an opacity of one half to {frame}.",
+        ),
+    ],
+    "text_uniform_resize": [
+        (
+            "Resize {text} uniformly to 240 by 150.",
+            "Resize {text} to 240 by 200 without changing its aspect ratio.",
+        ),
+        (
+            "Scale {text} to one and a half times its size: width 240, height 150.",
+            "Make {text} width 240 and height 200 independently.",
+        ),
+        (
+            "Could you resize {text} proportionally to width 240 and height 150?",
+            "Could you stretch {text} to width 240 and height 200?",
+        ),
+        (
+            "Increase {text} uniformly by 50 percent, to dimensions 240 by 150.",
+            "Change {text}'s dimensions independently to 240 by 200.",
+        ),
+    ],
+    "rejected_creation": [
+        (
+            "The drawing failed. Move the last created shape right {distance} units.",
+            "The drawing failed. Create a rectangle labelled {payload}.",
+        ),
+        (
+            "It did not create anything. Drag the last created shape right {distance}.",
+            "It did not create anything. Please draw a rectangle saying {payload}.",
+        ),
+        (
+            "The previous call was rejected; "
+            "shift the last created shape right {distance}.",
+            "The previous call was rejected; make a rectangle with the text {payload}.",
+        ),
+        (
+            "After that failed creation, "
+            "reposition the last created shape right {distance}.",
+            "After that failed creation, sketch a rectangle containing {payload}.",
+        ),
+    ],
+    "wrong_target_recovery": [
+        (
+            "You moved {other}, not {name}. Move {name} right {distance} units.",
+            "You moved {other}. Undo the last edit.",
+        ),
+        (
+            "That moved the wrong card. Please move {name} right by {distance}.",
+            "That moved the wrong card. Please undo it.",
+        ),
+        (
+            "No, the target was {name}; shift {name} right {distance} units.",
+            "No, the wrong target moved; undo that change.",
+        ),
+        (
+            "The last move affected {other}. "
+            "Reposition {name} rightward by {distance}.",
+            "The last move affected {other}. Revert that canvas edit.",
+        ),
+    ],
+    "wrong_pan_recovery": [
+        (
+            "That zoomed the view. Pan the canvas right {distance} units.",
+            "That zoomed the view. Move {name} right {distance} units.",
+        ),
+        (
+            "I meant camera movement; shift the viewport right {distance} units.",
+            "I meant moving the card; shift {name} right {distance} units.",
+        ),
+        (
+            "The zoom changed by mistake. Can you pan right by {distance} units?",
+            "The zoom changed by mistake. "
+            "Can you move {name} right by {distance} units?",
+        ),
+        (
+            "Following that incorrect zoom, "
+            "translate the view rightward by {distance} units.",
+            "Following that incorrect zoom, "
+            "translate the object {name} rightward by {distance} units.",
+        ),
+    ],
+    "rejected_rename": [
+        (
+            "The rename failed. Add property email to schema {schema}.",
+            "The rename failed. Add property email to schema {renamed}.",
+        ),
+        (
+            "It never changed the name. Put an email field on {schema}.",
+            "It never changed the name. Put an email field on {renamed}.",
+        ),
+        (
+            "After the rejected rename, add the email property to {schema}.",
+            "After the rejected rename, add the email property to {renamed}.",
+        ),
+        (
+            "The attempted title change did not apply. Append field email to {schema}.",
+            "The attempted title change did not apply. "
+            "Append field email to {renamed}.",
+        ),
+    ],
+    "default_move": [
+        ("Move {name} right.", "Move {name} right {distance} units."),
+        ("Drag {name} to the right.", "Drag {name} to the right by {distance}."),
+        ("Uh, shift {name} right.", "Uh, shift {name} right by {distance} units."),
+        (
+            "Reposition {name} rightward.",
+            "Reposition {name} rightward by {distance} page units.",
+        ),
+    ],
+    "default_pan": [
+        ("Pan the canvas down.", "Pan the canvas down {distance} units."),
+        ("Move the viewport downward.", "Move the viewport downward by {distance}."),
+        (
+            "Um, shift the camera down.",
+            "Um, shift the camera down {distance} page units.",
+        ),
+        (
+            "Translate the view downward.",
+            "Translate the view downward by {distance} page units.",
+        ),
+    ],
+    "polite_question": [
+        ("Could you delete {name}?", "Could you explain what {name} means?"),
+        (
+            "Can you remove {name} from the canvas?",
+            "Can you describe {name} without changing it?",
+        ),
+        (
+            "Would you move {name} right {distance} units?",
+            "Would you tell me where {name} is?",
+        ),
+        (
+            "Please erase the object labelled {name}.",
+            "Please explain the purpose of the object labelled {name}.",
+        ),
+    ],
+    "select_delete": [
+        ("Select {name}.", "Delete {name}."),
+        ("Pick the shape named {name}.", "Remove the shape named {name}."),
+        ("Can you highlight {name}?", "Can you erase {name}?"),
+        (
+            "Choose the object labelled {name}.",
+            "Get rid of the object labelled {name}.",
+        ),
+    ],
+    "zoom_out_in": [
+        ("Zoom out.", "Zoom in."),
+        ("Can you zoom the view out?", "Can you zoom the view in?"),
+        ("Uh, decrease the canvas zoom.", "Uh, increase the canvas zoom."),
+        ("Reduce the camera zoom.", "Increase the camera zoom."),
+    ],
+    "mixed_group_child_style": [
+        ("Make the selected group blue.", "Make {name} blue."),
+        (
+            "Give the selected group a blue outline.",
+            "Give the shape named {name} a blue outline.",
+        ),
+        (
+            "Could you color the selected group blue?",
+            "Could you color the child named {name} blue?",
+        ),
+        (
+            "Apply blue to the chosen group.",
+            "Apply blue directly to the object labelled {name}.",
+        ),
+    ],
+    "drawing_kind": [
+        (
+            "Create {drawing_a} with text {payload}.",
+            "Create {drawing_b} with text {payload}.",
+        ),
+        (
+            "Can you draw {drawing_a} saying {payload}?",
+            "Can you draw {drawing_b} saying {payload}?",
+        ),
+        (
+            "Um, make {drawing_a} labelled {payload}.",
+            "Um, make {drawing_b} labelled {payload}.",
+        ),
+        (
+            "Sketch {drawing_a} containing {payload}.",
+            "Sketch {drawing_b} containing {payload}.",
+        ),
+    ],
+}
+
+
+def quality_context(rng, split, group):
+    names = [f"{name} {group.rsplit('-', 1)[-1]}" for name in QUALITY_NAMES[split]]
+    ids = {
+        key: f"{group}:{key}"
+        for key in ("box", "other-box", "geo", "other-geo", "text", "note", "frame")
+    }
+    canvas = Canvas(
+        schemas=[
+            SchemaBox(
+                id=ids["box"],
+                name=names[0],
+                properties=["name", "subjects"],
+                methods=["getName", "getSubjects"],
+                x=-400,
+                order=0,
+            ),
+            SchemaBox(
+                id=ids["other-box"],
+                name=names[1],
+                properties=["id"],
+                methods=["save"],
+                x=-80,
+                order=1,
+            ),
+        ],
+        shapes=[
+            CanvasShape(
+                id=ids[key],
+                name=names[i + 2],
+                text=names[i + 2],
+                kind=kind,
+                x=240 + i * 200,
+                y=rng.choice([-160, 0, 160]),
+                w=200 if kind == "note" else 160,
+                h=200 if kind == "note" else 100,
+                order=i + 2,
+            )
+            for i, (key, kind) in enumerate(
+                (
+                    ("geo", "rectangle"),
+                    ("other-geo", "diamond"),
+                    ("text", "text"),
+                    ("note", "note"),
+                    ("frame", "frame"),
+                )
+            )
+        ],
+        selected_ids=[ids["other-geo"]],
+        camera={
+            "x": rng.choice([-240, 0, 240]),
+            "y": rng.choice([-160, 0, 160]),
+            "z": rng.choice([0.5, 1.0, 2.0]),
+        },
+    ).model_dump()
+    return CanvasSession(canvas), ids
+
+
+def quality_setup_outcome(session, receipt, command, action):
+    identifier = f"{receipt['id']}:setup-{len(receipt['events'])}"
+    session.execute(command, action, identifier)
+    receipt["events"].append(
+        {
+            "kind": "outcome",
+            "command": command,
+            "action": action,
+            "created_id": identifier,
+        }
+    )
+    return identifier
+
+
+def quality_setup_manual(session, receipt, events):
+    session.external(events)
+    receipt["events"].append({"kind": "manual", "events": events})
+
+
+def quality_row(
+    session,
+    command,
+    expected,
+    *,
+    identifier,
+    group,
+    split,
+    family,
+    wording,
+    reference,
+    rationale,
+):
+    action = validate_call(expected, session.canvas)
+    row = {
+        "id": identifier,
+        "group": group,
+        "split": split,
+        "command": command,
+        "canvas": copy.deepcopy(session.canvas),
+        "history": copy.deepcopy(session.history),
+        "expected": action,
+        "stratum": accuracy_stratum(action),
+        "wording_family": wording,
+        "reference_kind": reference,
+        "scenario": family,
+        "rationale": rationale,
+        "provenance": (
+            "Authored quality supplement; simulated current canvas "
+            "and actual recorded outcomes"
+        ),
+    }
+    issue = accuracy_capability_issue(row)
+    if issue:
+        raise ValueError(f"Unsupported native capability in {identifier}: {issue}")
+    copy.deepcopy(session).execute(command, action, identifier + ":verification")
+    return row
+
+
+def quality_pair(rng, split, index, family):
+    group = f"quality-{split}-pair-{index}"
+    base, ids = quality_context(rng, split, group)
+    receipts = [
+        {
+            "id": f"{group}:{i}",
+            "initial_canvas": copy.deepcopy(base.canvas),
+            "events": [],
+        }
+        for i in range(2)
+    ]
+    sessions = [copy.deepcopy(base), copy.deepcopy(base)]
+    names = base.objects()
+    distance = rng.choice([25, 40, 60, 80, 120])
+    values = {
+        "name": json.dumps(names[ids["geo"]]["name"]),
+        "other": json.dumps(names[ids["other-geo"]]["name"]),
+        "schema": json.dumps(names[ids["box"]]["name"]),
+        "renamed": json.dumps(f"Updated {names[ids['box']]['name']}"),
+        "final": json.dumps(f"Final {names[ids['box']]['name']}"),
+        "text": json.dumps(names[ids["text"]]["name"]),
+        "note": json.dumps(names[ids["note"]]["name"]),
+        "frame": json.dumps(names[ids["frame"]]["name"]),
+        "distance": distance,
+        "payload": json.dumps(f"Ready for {group.rsplit('-', 1)[-1]}"),
+        "literal": json.dumps(
+            rng.choice(["Save and delete", "Move and rename", "Select and remove"])
+        ),
+        "absent_field": "passportNumber" if split == "train" else "galleryCode",
+        "absent_method": "getPassport" if split == "train" else "getGallery",
+    }
+    kinds = (
+        KINDS[(index // len(QUALITY_PAIRS)) % len(KINDS)],
+        KINDS[((index // len(QUALITY_PAIRS)) + 4) % len(KINDS)],
+    )
+    drawings = {
+        "rectangle": "a rectangle",
+        "ellipse": "an ellipse",
+        "diamond": "a diamond",
+        "triangle": "a triangle",
+        "text": "a text label",
+        "note": "a note",
+        "frame": "a frame",
+        "arrow": "an arrow",
+    }
+    values.update(drawing_a=drawings[kinds[0]], drawing_b=drawings[kinds[1]])
+    templates = QUALITY_PAIRS[family]
+    slot = rng.randrange(len(templates) - 1) if split == "train" else len(templates) - 1
+    commands = [text.format(**values) for text in templates[slot]]
+    a, b, box = ids["geo"], ids["other-geo"], ids["box"]
+    missing, ambiguous, unsupported = (
+        no_action(reason)
+        for reason in ("missing_target", "ambiguous_target", "unsupported_request")
+    )
+    actions, reference = None, family
+
+    def move(target, dx=distance, dy=0):
+        return call(
+            "move_shapes",
+            shape_ids=[target] if isinstance(target, str) else target,
+            dx=dx,
+            dy=dy,
+        )
+
+    def both_outcome(command, action):
+        return [
+            quality_setup_outcome(session, receipt, command, action)
+            for session, receipt in zip(sessions, receipts, strict=True)
+        ]
+
+    def manual(which, events):
+        quality_setup_manual(sessions[which], receipts[which], events)
+
+    if family == "named_selection":
+        actions = [move(a), move(b)]
+    elif family == "duplicate_name":
+        for i in range(2):
+            manual(
+                i,
+                [
+                    {"kind": "text", "id": b, "text": names[a]["name"]},
+                    {"kind": "select", "ids": [a]},
+                ],
+            )
+        actions = [ambiguous, move(a, 0, distance)]
+    elif family == "stale_name":
+        both_outcome(
+            f"Rename schema {values['schema']} to {values['renamed']}.",
+            call(
+                "rename_schema", schema_id=box, new_name=json.loads(values["renamed"])
+            ),
+        )
+        actions = [
+            missing,
+            call("rename_schema", schema_id=box, new_name=json.loads(values["final"])),
+        ]
+    elif family == "deleted_name":
+        both_outcome(f"Delete {values['name']}.", call("delete_shapes", shape_ids=[a]))
+        actions = [missing, move(b, -distance)]
+    elif family == "empty_selection":
+        manual(0, [{"kind": "select", "ids": []}])
+        manual(1, [{"kind": "select", "ids": [a]}])
+        actions = [
+            ambiguous,
+            call("set_text", shape_id=a, text=json.loads(values["payload"])),
+        ]
+    elif family == "plural_selection":
+        for i in range(2):
+            manual(i, [{"kind": "select", "ids": [a, b]}])
+        actions = [ambiguous, move(sorted([a, b]))]
+    elif family == "deleted_last_created":
+        created = both_outcome(
+            f"Create a rectangle labelled {values['payload']}.",
+            call("create_shape", kind="rectangle", text=json.loads(values["payload"])),
+        )
+        manual(
+            1, [{"kind": "delete", "id": created[1]}, {"kind": "select", "ids": [b]}]
+        )
+        actions = [move(created[0]), missing]
+    elif family == "last_edited":
+        both_outcome(
+            f"Move {values['name']} down {distance} units.", move(a, 0, distance)
+        )
+        for i in range(2):
+            manual(i, [{"kind": "select", "ids": [b]}])
+        actions = [
+            call("style_shapes", shape_ids=[a], color="blue"),
+            call("style_shapes", shape_ids=[b], color="blue"),
+        ]
+    elif family == "missing_field":
+        actions = [
+            missing,
+            call("remove_property", schema_id=box, property_name="name"),
+        ]
+    elif family == "missing_method":
+        actions = [missing, call("remove_method", schema_id=box, method_name="getName")]
+    elif family == "target_correction":
+        actions = [move(b), unsupported]
+    elif family == "direction_correction":
+        actions = [move(a), unsupported]
+    elif family == "cancel":
+        actions = [unsupported, call("delete_shapes", shape_ids=[a])]
+    elif family == "literal_conjunction":
+        actions = [
+            call("set_text", shape_id=a, text=json.loads(values["literal"])),
+            unsupported,
+        ]
+    elif family in ("pan_move", "wrong_pan_recovery"):
+        if family == "wrong_pan_recovery":
+            both_outcome(
+                f"Pan the canvas right {distance} units.",
+                call("canvas_command", operation="zoom_in"),
+            )
+        actions = [call("pan_canvas", dx=distance, dy=0), move(a)]
+    elif family == "pan_zoom":
+        actions = [
+            call("pan_canvas", dx=0, dy=distance),
+            call("canvas_command", operation="zoom_to_fit"),
+        ]
+    elif family == "zoom_opacity":
+        actions = [
+            call("canvas_command", operation="reset_zoom"),
+            call("style_shapes", shape_ids=[a], opacity=1.0),
+        ]
+    elif family == "clear_delete":
+        for i in range(2):
+            manual(i, [{"kind": "select", "ids": [a, b]}])
+        actions = [
+            call("canvas_command", operation="clear_selection"),
+            call("delete_shapes", shape_ids=sorted([a, b])),
+        ]
+    elif family in ("undo", "redo"):
+        quality_setup_outcome(
+            sessions[0],
+            receipts[0],
+            f"Move {values['name']} right {distance} units.",
+            move(a),
+        )
+        if family == "redo":
+            quality_setup_outcome(
+                sessions[0],
+                receipts[0],
+                "Undo that edit.",
+                call("canvas_command", operation="undo"),
+            )
+        actions = [call("canvas_command", operation=family), missing]
+    elif family == "note_resize":
+        actions = [unsupported, call("resize_shape", shape_id=a, width=240, height=150)]
+    elif family == "text_fill":
+        actions = [unsupported, call("style_shapes", shape_ids=[a], fill="solid")]
+    elif family == "frame_color":
+        actions = [
+            unsupported,
+            call("style_shapes", shape_ids=[ids["frame"]], opacity=0.5),
+        ]
+    elif family == "text_uniform_resize":
+        actions = [
+            call("resize_shape", shape_id=ids["text"], width=240, height=150),
+            unsupported,
+        ]
+    elif family == "rejected_creation":
+        both_outcome(f"Create a rectangle labelled {values['payload']}.", None)
+        actions = [
+            missing,
+            call("create_shape", kind="rectangle", text=json.loads(values["payload"])),
+        ]
+    elif family == "wrong_target_recovery":
+        both_outcome(f"Move {values['name']} right {distance} units.", move(b))
+        actions = [move(a), call("canvas_command", operation="undo")]
+    elif family == "rejected_rename":
+        both_outcome(f"Rename schema {values['schema']} to {values['renamed']}.", None)
+        actions = [call("add_property", schema_id=box, property_name="email"), missing]
+    elif family == "default_move":
+        actions = [move(a, 100), move(a)]
+    elif family == "default_pan":
+        actions = [
+            call("pan_canvas", dx=0, dy=100),
+            call("pan_canvas", dx=0, dy=distance),
+        ]
+    elif family == "polite_question":
+        actions = [
+            move(a) if slot == 2 else call("delete_shapes", shape_ids=[a]),
+            unsupported,
+        ]
+    elif family == "select_delete":
+        actions = [
+            call("select_shapes", shape_ids=[a]),
+            call("delete_shapes", shape_ids=[a]),
+        ]
+    elif family == "zoom_out_in":
+        actions = [
+            call("canvas_command", operation="zoom_out"),
+            call("canvas_command", operation="zoom_in"),
+        ]
+    elif family == "mixed_group_child_style":
+        both_outcome(
+            f"Group {values['name']} and {values['frame']}.",
+            call(
+                "arrange_shapes", shape_ids=sorted([a, ids["frame"]]), operation="group"
+            ),
+        )
+        actions = [unsupported, call("style_shapes", shape_ids=[a], color="blue")]
+    elif family == "drawing_kind":
+        actions = [
+            call("create_shape", kind=kind, text=json.loads(values["payload"]))
+            for kind in kinds
+        ]
+    else:
+        raise ValueError(f"Unknown quality pair family: {family}")
+    rows = [
+        quality_row(
+            session,
+            command,
+            action,
+            identifier=f"{group}:{i}",
+            group=group,
+            split=split,
+            family=family,
+            wording=f"quality-{split}-{family}-{slot}",
+            reference=reference,
+            rationale=(
+                f"Authored {family} contrast, side {i + 1}; "
+                "label grounded in captured current canvas and recorded setup outcomes."
+            ),
+        )
+        for i, (session, command, action) in enumerate(
+            zip(sessions, commands, actions, strict=True)
+        )
+    ]
+    pair = {
+        "id": group,
+        "split": split,
+        "scenario": family,
+        "example_ids": [row["id"] for row in rows],
+        "same_canvas_and_history": rows[0]["canvas"] == rows[1]["canvas"]
+        and rows[0]["history"] == rows[1]["history"],
+        "same_model_canvas_and_history": messages_for(
+            "", rows[0]["canvas"], rows[0]["history"]
+        )
+        == messages_for("", rows[1]["canvas"], rows[1]["history"]),
+        "same_command": commands[0] == commands[1],
+        "wording_family": rows[0]["wording_family"],
+    }
+    return rows, receipts, pair
+
+
+def quality_session(rng, split, index, turns=72):
+    if turns < 60 or turns > 80:
+        raise ValueError("Quality sessions must contain 60 to 80 coherent turns.")
+    group = f"quality-{split}-session-{index}"
+    session, ids = quality_context(rng, split, group)
+    session.external([{"kind": "select", "ids": []}])
+    initial = copy.deepcopy(session.canvas)
+    rows, steps = [], []
+
+    def emit(command, action, reference="named", before=None):
+        turn = len(rows)
+        before = before or []
+        session.external(before)
+        row = quality_row(
+            session,
+            command,
+            action,
+            identifier=f"{group}:{turn}",
+            group=group,
+            split=split,
+            family="coherent_editing_session",
+            wording=f"quality-{split}-session-{turn % 36}",
+            reference=reference,
+            rationale=(
+                "One edit in a coherent create/refine/schema/link/group/manual-edit/"
+                "undo workflow; current visible state determines its target."
+            ),
+        )
+        rows.append(row)
+        steps.append(
+            {
+                "id": row["id"],
+                "command": command,
+                "expected": row["expected"],
+                "before": before,
+            }
+        )
+        created_id = f"{group}:created-{turn}"
+        session.execute(command, row["expected"], created_id)
+        return created_id
+
+    def words(train, valid):
+        return train if split == "train" else valid
+
+    for block in range(3):
+        start = len(rows)
+        suffix = f"{index}-{block}"
+        card = f"{'Packing task' if split == 'train' else 'Exhibit task'} {suffix}"
+        refined = (
+            f"{'Ready parcel' if split == 'train' else 'Prepared exhibit'} {suffix}"
+        )
+        duplicate = (
+            f"{'Backup parcel' if split == 'train' else 'Spare exhibit'} {suffix}"
+        )
+        schema = f"{'Shipment order' if split == 'train' else 'Gallery order'} {suffix}"
+        renamed = (
+            f"{'Reviewed shipment' if split == 'train' else 'Reviewed gallery'} "
+            f"{suffix}"
+        )
+        manual_name = (
+            "Manually checked parcel"
+            if split == "train"
+            else "Manually checked exhibit"
+        )
+        manual = f"{manual_name} {suffix}"
+        quoted = {
+            key: json.dumps(value)
+            for key, value in (
+                ("card", card),
+                ("refined", refined),
+                ("duplicate", duplicate),
+                ("schema", schema),
+                ("renamed", renamed),
+                ("manual", manual),
+            )
+        }
+        card_id = emit(
+            words(
+                f"Draw a rectangle saying {quoted['card']}.",
+                f"Sketch a rectangular card containing {quoted['card']}.",
+            ),
+            call("create_shape", kind="rectangle", text=card),
+            "new",
+        )
+        emit(
+            words("Move it right.", "Shift the chosen card rightward."),
+            call("move_shapes", shape_ids=[card_id], dx=100, dy=0),
+            "selected",
+        )
+        emit(
+            words(
+                "Resize the selected card to 240 by 150.",
+                "Give the chosen card a width of 240 and a height of 150.",
+            ),
+            call("resize_shape", shape_id=card_id, width=240, height=150),
+            "selected",
+        )
+        emit(
+            words(
+                f"Set its text to {quoted['refined']}.",
+                f"Replace the chosen card's label with {quoted['refined']}.",
+            ),
+            call("set_text", shape_id=card_id, text=refined),
+            "selected",
+        )
+        emit(
+            words(
+                f"Make {quoted['refined']} blue.",
+                f"Apply blue to the object labelled {quoted['refined']}.",
+            ),
+            call("style_shapes", shape_ids=[card_id], color="blue"),
+            before=[{"kind": "move", "id": card_id, "dx": -35, "dy": 20}],
+        )
+        emit(
+            words(
+                "Move the last created shape down 40 units.",
+                "Reposition the last created shape 40 units downward.",
+            ),
+            call("move_shapes", shape_ids=[card_id], dx=0, dy=40),
+            "last_created",
+            [{"kind": "select", "ids": [ids["other-geo"]]}],
+        )
+        emit(
+            words("Clear the selection.", "Release the current selection."),
+            call("canvas_command", operation="clear_selection"),
+            "canvas",
+        )
+        emit(
+            words(
+                "Move it left 25 units.",
+                "Shift that selected object leftward by 25 units.",
+            ),
+            no_action("ambiguous_target"),
+            "no_selection",
+        )
+        emit(
+            words(
+                f"Select {quoted['refined']}.",
+                f"Choose the object labelled {quoted['refined']}.",
+            ),
+            call("select_shapes", shape_ids=[card_id]),
+        )
+        copy_id = emit(
+            words("Duplicate the selected card.", "Make a copy of the chosen card."),
+            call("arrange_shapes", shape_ids=[card_id], operation="duplicate"),
+            "selected",
+        )
+        emit(
+            words(
+                f"Move {quoted['refined']} right 25 units.",
+                f"Reposition {quoted['refined']} rightward by 25 units.",
+            ),
+            no_action("ambiguous_target"),
+            "duplicate_name",
+        )
+        emit(
+            words(
+                "Move the selected copy right 60 units.",
+                "Shift this chosen copy 60 units rightward.",
+            ),
+            call("move_shapes", shape_ids=[copy_id], dx=60, dy=0),
+            "selected",
+        )
+        emit(
+            words(
+                f"Change its text to {quoted['duplicate']}.",
+                f"Give the selected copy the label {quoted['duplicate']}.",
+            ),
+            call("set_text", shape_id=copy_id, text=duplicate),
+            "selected",
+        )
+        box_id = emit(
+            words(
+                f"Create schema {quoted['schema']} with fields name, class, subjects "
+                "and methods getName, getClass, getSubjects.",
+                f"Build the {quoted['schema']} class: "
+                "properties name, class, subjects; "
+                "functions getName, getClass, getSubjects.",
+            ),
+            call(
+                "create_schema_box",
+                name=schema,
+                fields=["name", "class", "subjects"],
+                methods=["getName", "getClass", "getSubjects"],
+            ),
+            "new",
+        )
+        emit(
+            words(
+                f"Add property email to {quoted['schema']}.",
+                f"Append an email field to the {quoted['schema']} class.",
+            ),
+            call("add_property", schema_id=box_id, property_name="email"),
+        )
+        emit(
+            words(
+                f"Remove field class from {quoted['schema']}.",
+                f"Drop the class property on {quoted['schema']}.",
+            ),
+            call("remove_property", schema_id=box_id, property_name="class"),
+        )
+        emit(
+            words(
+                f"Add method addSubject to {quoted['schema']}.",
+                f"Append the addSubject operation to {quoted['schema']}.",
+            ),
+            call("add_method", schema_id=box_id, method_name="addSubject"),
+        )
+        emit(
+            words(
+                f"Remove method getClass from {quoted['schema']}.",
+                f"Drop the getClass function on {quoted['schema']}.",
+            ),
+            call("remove_method", schema_id=box_id, method_name="getClass"),
+        )
+        emit(
+            words(
+                f"Rename schema {quoted['schema']} to {quoted['renamed']}.",
+                f"Replace the title on the {quoted['schema']} class "
+                f"with {quoted['renamed']}.",
+            ),
+            call("rename_schema", schema_id=box_id, new_name=renamed),
+        )
+        emit(
+            words(
+                f"Add property ownerId to {quoted['schema']}.",
+                f"Append ownerId to the {quoted['schema']} class.",
+            ),
+            no_action("missing_target"),
+            "stale_name",
+        )
+        emit(
+            words(
+                f"Add property ownerId to {quoted['renamed']}.",
+                f"Append ownerId to the {quoted['renamed']} class.",
+            ),
+            call("add_property", schema_id=box_id, property_name="ownerId"),
+        )
+        emit(
+            words(
+                f"Connect {quoted['renamed']} to {quoted['refined']} "
+                "with label contains.",
+                f"Link the source {quoted['renamed']} to destination "
+                f"{quoted['refined']}, with contains as the connection label.",
+            ),
+            call(
+                "connect_schemas", source_id=box_id, target_id=card_id, label="contains"
+            ),
+        )
+        emit(
+            words("Pan the canvas down.", "Translate the view downward."),
+            call("pan_canvas", dx=0, dy=100),
+            "canvas",
+        )
+        emit(
+            words(
+                "Zoom to fit all shapes.", "Frame the whole drawing in the viewport."
+            ),
+            call("canvas_command", operation="zoom_to_fit"),
+            "canvas",
+        )
+        emit(
+            words(
+                f"Select {quoted['refined']} and {quoted['duplicate']}.",
+                f"Choose both {quoted['refined']} and {quoted['duplicate']}.",
+            ),
+            call("select_shapes", shape_ids=sorted([card_id, copy_id])),
+        )
+        group_id = emit(
+            words(
+                "Group the selected cards.", "Combine the chosen cards into a group."
+            ),
+            call(
+                "arrange_shapes",
+                shape_ids=sorted([card_id, copy_id]),
+                operation="group",
+            ),
+            "selected",
+        )
+        emit(
+            words(
+                "Move the selected group right 40 units.",
+                "Shift the chosen group 40 units rightward.",
+            ),
+            call("move_shapes", shape_ids=[group_id], dx=40, dy=0),
+            "selected",
+        )
+        emit(
+            words(
+                "Make the selected group green.",
+                "Apply green recursively to the chosen group.",
+            ),
+            call("style_shapes", shape_ids=[group_id], color="green"),
+            "selected",
+        )
+        emit(
+            words(
+                "Ungroup the selected group.",
+                "Separate the members of the chosen group.",
+            ),
+            call("arrange_shapes", shape_ids=[group_id], operation="ungroup"),
+            "selected",
+        )
+        emit(
+            words(
+                f"Move {quoted['manual']} left 25 units.",
+                f"Reposition the manually relabelled {quoted['manual']} "
+                "25 units leftward.",
+            ),
+            call("move_shapes", shape_ids=[card_id], dx=-25, dy=0),
+            "manual_rename",
+            [{"kind": "text", "id": card_id, "text": manual}],
+        )
+        emit(
+            words(
+                f"Delete {quoted['duplicate']}.",
+                f"Erase the object labelled {quoted['duplicate']}.",
+            ),
+            no_action("missing_target"),
+            "manual_delete",
+            [{"kind": "delete", "id": copy_id}],
+        )
+        emit(
+            words("Undo that last deletion.", "Revert the latest canvas edit."),
+            call("canvas_command", operation="undo"),
+            "canvas",
+        )
+        emit(
+            words("Redo that deletion.", "Reapply the previously undone edit."),
+            call("canvas_command", operation="redo"),
+            "canvas",
+        )
+        emit(
+            words("Undo that deletion again.", "Revert the last edit once more."),
+            call("canvas_command", operation="undo"),
+            "canvas",
+        )
+        emit(
+            words(
+                f"Align {quoted['manual']} and {quoted['duplicate']} on the left.",
+                f"Give {quoted['manual']} and {quoted['duplicate']} "
+                "the same left edge.",
+            ),
+            call(
+                "arrange_shapes",
+                shape_ids=sorted([card_id, copy_id]),
+                operation="align_left",
+            ),
+        )
+        emit(
+            words("Clear the selection.", "Release the chosen objects."),
+            call("canvas_command", operation="clear_selection"),
+            "canvas",
+        )
+        if len(rows) - start != 36:
+            raise ValueError("The coherent editing block must contain 36 turns.")
+        if len(rows) >= turns:
+            break
+    rows, steps = rows[:turns], steps[:turns]
+    # Truncated sessions must retain the state at their final recorded turn.
+    final = CanvasSession(initial)
+    for turn, step in enumerate(steps):
+        final.external(step["before"])
+        final.execute(step["command"], step["expected"], f"{group}:created-{turn}")
+    return rows, {
+        "id": group,
+        "split": split,
+        "initial_canvas": initial,
+        "turns": steps,
+        "final_snapshot": final.snapshot(),
+        "provenance": (
+            "Authored coherent workflow with recorded manual user edits; "
+            "oracle actions, no model rollout"
+        ),
+    }
+
+
+def audit_quality_supplement(rows, cases, receipts, pairs):
+    ids, fingerprints, labels, groups = {}, {}, {}, {}
+    for row in rows:
+        if row["split"] not in ("train", "valid") or row["id"] in ids:
+            raise ValueError(
+                "Quality data has an invalid split or duplicate example ID."
+            )
+        action = validate_call(row["expected"], row["canvas"])
+        if action != row["expected"]:
+            raise ValueError("Quality labels must use canonical action arguments.")
+        fingerprint = accuracy_fingerprint(row)
+        label = json.dumps(model_call(action, row["canvas"]), sort_keys=True)
+        if fingerprint in labels and labels[fingerprint] != label:
+            raise ValueError("The same quality input has conflicting action labels.")
+        if fingerprint in fingerprints:
+            raise ValueError(
+                "Quality data must not contain duplicate full model inputs."
+            )
+        if row["group"] in groups and groups[row["group"]] != row["split"]:
+            raise ValueError("A quality scenario group occurs across splits.")
+        if accuracy_capability_issue(row):
+            raise ValueError(
+                "A quality action requires an unsupported native capability."
+            )
+        ids[row["id"]], fingerprints[fingerprint], labels[fingerprint] = (
+            row,
+            row["split"],
+            label,
+        )
+        groups[row["group"]] = row["split"]
+    for receipt in receipts:
+        session = CanvasSession(receipt["initial_canvas"])
+        for event in receipt["events"]:
+            if event["kind"] == "outcome":
+                session.execute(event["command"], event["action"], event["created_id"])
+            else:
+                session.external(event["events"])
+        row = ids[receipt["id"]]
+        if row["canvas"] != session.canvas or row["history"] != session.history:
+            raise ValueError(
+                f"Counterfactual setup replay differs from captured input: {row['id']}"
+            )
+        session.execute(row["command"], row["expected"], row["id"] + ":verification")
+    for case in cases:
+        session = CanvasSession(case["initial_canvas"])
+        for turn, step in enumerate(case["turns"]):
+            session.external(step["before"])
+            row = ids[step["id"]]
+            if row["canvas"] != session.canvas or row["history"] != session.history:
+                raise ValueError(
+                    f"Coherent session replay differs from captured input: {row['id']}"
+                )
+            if row["command"] != step["command"] or row["expected"] != step["expected"]:
+                raise ValueError("Session turns and supervised labels must agree.")
+            session.execute(
+                step["command"], step["expected"], f"{case['id']}:created-{turn}"
+            )
+        if session.snapshot() != case["final_snapshot"]:
+            raise ValueError(
+                "The replayed session does not reach its recorded final state."
+            )
+    for pair in pairs:
+        a, b = (ids[identifier] for identifier in pair["example_ids"])
+        if model_call(a["expected"], a["canvas"]) == model_call(
+            b["expected"], b["canvas"]
+        ):
+            raise ValueError("A contrastive pair must teach different action labels.")
+    covered = [receipt["id"] for receipt in receipts] + [
+        step["id"] for case in cases for step in case["turns"]
+    ]
+    if Counter(covered) != Counter(ids.keys()):
+        raise ValueError(
+            "Every supervised quality input requires exactly one replay receipt."
+        )
+    reversals = [
+        {
+            "id": row["id"],
+            "scenario": row["scenario"],
+            "command": row["command"],
+            "expected": row["expected"],
+            "guarded": guarded,
+        }
+        for row in rows
+        if (
+            guarded := execution_guard(
+                row["command"], row["expected"], row["canvas"], row["history"]
+            )
+        )
+        != row["expected"]
+    ]
+    return {
+        "splits": dict(Counter(row["split"] for row in rows)),
+        "unique_full_inputs": len(fingerprints),
+        "duplicate_inputs": 0,
+        "conflicting_labels": 0,
+        "native_capability_failures": 0,
+        "independent_replay_inputs": len(receipts),
+        "session_replay_turns": dict(
+            Counter(case["split"] for case in cases for _ in case["turns"])
+        ),
+        "guard_reversals": reversals,
+        "guard_reversal_count": len(reversals),
+    }
+
+
+def build_quality_supplement(
+    output,
+    *,
+    seed=72,
+    train_pairs=768,
+    dev_pairs=96,
+    train_sessions=12,
+    dev_sessions=3,
+    session_turns=72,
+):
+    if (
+        min(train_pairs, dev_pairs) < len(QUALITY_PAIRS)
+        or min(train_sessions, dev_sessions) < 1
+    ):
+        raise ValueError(
+            "Both quality splits must include every contrast family "
+            "and a coherent session."
+        )
+    if session_turns < 60 or session_turns > 80:
+        raise ValueError("Quality sessions must contain 60 to 80 coherent turns.")
+    output.mkdir(parents=True, exist_ok=False)
+    rows, cases, receipts, pairs = [], [], [], []
+    for split, pair_count, session_count, offset in (
+        ("train", train_pairs, train_sessions, 0),
+        ("valid", dev_pairs, dev_sessions, 10000),
+    ):
+        rng = random.Random(seed + offset)
+        for index in range(pair_count):
+            family = list(QUALITY_PAIRS)[index % len(QUALITY_PAIRS)]
+            examples, setup, pair = quality_pair(rng, split, index, family)
+            rows.extend(examples)
+            receipts.extend(setup)
+            pairs.append(pair)
+        for index in range(session_count):
+            examples, case = quality_session(rng, split, index, session_turns)
+            rows.extend(examples)
+            cases.append(case)
+    audit = audit_quality_supplement(rows, cases, receipts, pairs)
+    for filename, values in (
+        ("examples.jsonl", rows),
+        ("sessions.jsonl", cases),
+        ("counterfactual-setups.jsonl", receipts),
+        ("contrastive-pairs.jsonl", pairs),
+    ):
+        (output / filename).write_text(
+            "".join(json.dumps(value) + "\n" for value in values)
+        )
+    (output / "data-audit.json").write_text(json.dumps(audit, indent=2))
+    summary = {
+        "seed": seed,
+        "status": "Generated and audited; no model trained or accuracy measured",
+        "splits": audit["splits"],
+        "unique_full_inputs": audit["unique_full_inputs"],
+        "contrastive_pairs": dict(Counter(pair["split"] for pair in pairs)),
+        "pair_scenarios": {
+            split: dict(
+                Counter(pair["scenario"] for pair in pairs if pair["split"] == split)
+            )
+            for split in ("train", "valid")
+        },
+        "sessions": dict(Counter(case["split"] for case in cases)),
+        "session_turns": audit["session_replay_turns"],
+        "manual_events": dict(
+            Counter(
+                event["kind"]
+                for case in cases
+                for step in case["turns"]
+                for event in step["before"]
+            )
+        ),
+        "tools": {
+            split: dict(
+                Counter(
+                    row["expected"]["name"] for row in rows if row["split"] == split
+                )
+            )
+            for split in ("train", "valid")
+        },
+        "generic_drawing_kinds": {
+            split: dict(
+                Counter(
+                    row["expected"]["arguments"]["kind"]
+                    for row in rows
+                    if row["split"] == split and row["scenario"] == "drawing_kind"
+                )
+            )
+            for split in ("train", "valid")
+        },
+        "guard_reversals": audit["guard_reversal_count"],
+        "simulator_version": SIMULATOR_VERSION,
+        "split_provenance": {
+            "names": QUALITY_NAMES,
+            "train_sentence_slots": [0, 1, 2],
+            "development_sentence_slots": [3],
+            "test_split": "None; existing v7 holdout not read or changed",
+        },
+        "recovery_provenance": (
+            "Independent counterfactual states use injected executed wrong actions "
+            "or rejected (null) outcomes; these are simulated, "
+            "not real model rollouts or DAgger"
+        ),
+        "limitations": [
+            "State replay uses Python simulation; pixel geometry, text fitting, "
+            "connection bounds, group geometry and zoom-to-fit remain approximate",
+            "Sustained sessions contain oracle actions and manual edits; "
+            "wrong/rejected agent outcomes are covered by independent "
+            "replayable counterfactual cases",
+            "Canonical labels and native capability checks "
+            "do not establish live model accuracy",
+        ],
+        "artifact_sha256": {
+            name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+            for name in (
+                "examples.jsonl",
+                "sessions.jsonl",
+                "counterfactual-setups.jsonl",
+                "contrastive-pairs.jsonl",
+                "data-audit.json",
+            )
+        },
+        "source_sha256": {
+            name: hashlib.sha256(
+                Path(__file__).with_name(name).read_bytes()
+            ).hexdigest()
+            for name in ("build_workflow.py", "actions.py", "sessions.py")
+        },
+    }
+    (output / "dataset-summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate general canvas instruction and editing-session data."
     )
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--source", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=64)
     parser.add_argument("--independent", type=int, default=80000)
@@ -2402,8 +3972,16 @@ def main():
     parser.add_argument("--replay", type=int, default=12000)
     parser.add_argument("--spoken-refinement", type=int, default=0)
     parser.add_argument("--accuracy-refinement", type=int, default=0)
+    parser.add_argument("--quality-supplement", action="store_true")
     parser.add_argument("--practice-sessions", type=int, default=800)
     args = parser.parse_args()
+    if args.quality_supplement:
+        if args.accuracy_refinement or args.spoken_refinement:
+            parser.error("Use one refinement mode at a time.")
+        build_quality_supplement(args.output, seed=args.seed)
+        return
+    if args.source is None:
+        parser.error("--source is required for existing workflow/refinement modes.")
     if args.output.resolve() == args.source.resolve():
         raise ValueError("Keep the previous dataset frozen.")
     if args.accuracy_refinement:

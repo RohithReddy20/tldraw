@@ -209,7 +209,7 @@ reports now separate document, selection, and camera agreement.
 
 The private Kaggle job
 [`rohithresearch/canvas-270m-v7-accuracy-refinement`](https://www.kaggle.com/code/rohithresearch/canvas-270m-v7-accuracy-refinement)
-is running from source commit `2d383d112`. The frozen corpus and sources are under
+completed 3,000 updates from source commit `2d383d112`. The frozen corpus and sources are under
 `training/runs/v7-accuracy-workflow-revised/`; launch metadata and live logs are
 under `training/runs/kaggle/accuracy/`. Preflight passed 73 Python tests, the
 function-call token round trips, and a sampler check showing all 24,000 unique
@@ -217,7 +217,42 @@ rows selected exactly once. The longest input is 4,242 tokens and response is 68
 The monitor uses the frozen source, prevents idle sleep, retrieves and verifies
 checkpoints, runs both native model integration tests, and starts final scoring
 only after validation and native checks pass. Desktop completion notifications
-are configured. New model accuracy remains unmeasured until these jobs finish.
+are configured.
+
+On the fixed 256-command development subset, the 500-update checkpoint scored
+88.67% guarded exact accuracy versus 78.52% for the starting adapter. Across the
+six development sessions (192 turns), action accuracy was 67.19% versus 33.33%.
+That checkpoint regressed on zoom-out, ambiguous targets, and unsupported
+requests, so it failed the per-operation and rejection-reason promotion gate.
+Neither later checkpoint passed. The previous adapter was retained; full
+validation, native model checks, and the fresh test were not run for a replacement.
+These scores use the version-seven development contexts and simulator. Recorded GPU
+activity averaged 96.08% and 96.25% on the two T4s; median speed was 0.325 optimizer
+updates per second, and training took 9,633 seconds including warmup and saves.
+
+`build_workflow.py --quality-supplement --output training/runs/quality-next/supplement-revised-v2 --seed 72`
+creates a separate supplement with 2,400 training and 408 development examples.
+It contains 768 training and 96 development contrast pairs across 35 scenarios,
+plus 12 training and three development sessions of 72 turns. Same-context pairs
+distinguish panning, shape movement, and zoom in/out; other pairs exercise named and
+selected targets, stale names, duplicate names, native capability refusals,
+literal captions, actual self-corrections, and recovery from simulated wrong or
+rejected prior actions. Creation covers all eight drawing kinds. Group examples
+distinguish an unsupported mixed-group edit from styling its supported child.
+Each input has a replay receipt and a canonical label;
+the export checks full-input uniqueness, label conflicts, capability support,
+session replay, split separation, and execution-guard changes. The opt-in mode
+does not use or change the frozen version-seven data or test reservation.
+
+Supplemental note contexts use default 200-by-200 dimensions, and frame contexts
+report black, matching the native shape utilities. The guard now excludes quoted
+captions and explicitly cancelled clauses when checking for extra edits or stale
+history references. Native browser checks cover note and frame contexts and moves
+targeting a child of a group. Full geometry and zoom-to-fit remain simulated
+approximations. This supplement has not been trained; its accuracy gain is unknown.
+Independent semantic review corrected 54 unavailable undo/redo refusal reasons to
+`missing_target`. All 2,808 final inputs pass function-call token round trips;
+the longest input is 4,326 tokens within the 6,144-token sequence limit.
 
 The workflow follows Google's [FunctionGemma fine-tuning guidance](https://ai.google.dev/gemma/docs/functiongemma/finetuning-with-functiongemma).
 The [APIGen paper](https://arxiv.org/abs/2406.18518) provides a reference for checking
