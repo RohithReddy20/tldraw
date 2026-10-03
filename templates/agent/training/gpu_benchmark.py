@@ -1107,6 +1107,8 @@ def evaluate_quality(output):
                     output=report_path,
                     limit=None,
                     guarded=guarded,
+                    cache_prefix=True,
+                    batch_size=8 if function is evaluate else 1,
                 )
             )
             report = json.loads(report_path.read_text())
@@ -1136,6 +1138,8 @@ def score_selected_split(output, split):
                     output=path,
                     limit=None,
                     guarded=guarded,
+                    cache_prefix=True,
+                    batch_size=8 if function is evaluate else 1,
                 )
             )
             report = json.loads(path.read_text())

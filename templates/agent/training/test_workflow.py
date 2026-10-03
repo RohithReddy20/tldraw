@@ -1,3 +1,4 @@
+import argparse
 import copy
 import json
 import re
@@ -5,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from actions import (
@@ -679,6 +681,123 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "retained tool prefix"):
             retained.prepare(model, tokenizer, "<bos>changed tools")
         model.assert_not_called()
+
+    def test_batch_predictions_keep_aliases_separate_with_out_of_order_tokens(self):
+        from lab import predict_batch
+
+        canvases = [
+            {
+                "schemas": [],
+                "shapes": [{"id": identifier, "kind": "rectangle", "name": "Box"}],
+            }
+            for identifier in ("first-canvas-shape", "second-canvas-shape")
+        ]
+        examples = [
+            {"command": "Move Box right by 100.", "canvas": canvas}
+            for canvas in canvases
+        ]
+        text = (
+            "<start_function_call>call:move_shapes{shape_ids:[<escape>shape1<escape>],"
+            "dx:100,dy:0}<end_function_call>"
+        )
+        tokenizer = Mock(bos_token="<bos>", eos_token_ids=[0])
+        tokenizer.apply_chat_template.return_value = "<bos>prompt"
+        tokenizer.encode.return_value = [98]
+        tokenizer.decode.return_value = text
+        generator = Mock()
+        generator.insert.return_value = [7, 3]
+        generator.next_generated.side_effect = [
+            [
+                SimpleNamespace(uid=3, token=12, finish_reason=None),
+                SimpleNamespace(uid=7, token=11, finish_reason=None),
+            ],
+            [
+                SimpleNamespace(uid=3, token=0, finish_reason="stop"),
+                SimpleNamespace(uid=7, token=0, finish_reason="stop"),
+            ],
+            [],
+        ]
+        with patch("mlx_lm.generate.BatchGenerator", return_value=generator):
+            results = predict_batch(Mock(), tokenizer, examples, guarded=True)
+        self.assertEqual(
+            [row["prediction"] for row in results],
+            [
+                {
+                    "name": "move_shapes",
+                    "arguments": {"shape_ids": [identifier], "dx": 100.0, "dy": 0.0},
+                }
+                for identifier in ("first-canvas-shape", "second-canvas-shape")
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in tokenizer.decode.call_args_list], [[11], [12]]
+        )
+        self.assertEqual([row["error"] for row in results], [None, None])
+        generator.close.assert_called_once()
+
+    def test_batch_prediction_closes_generator_if_a_command_never_finishes(self):
+        from lab import predict_batch
+
+        tokenizer = Mock(bos_token="<bos>", eos_token_ids=[0])
+        tokenizer.apply_chat_template.return_value = "<bos>prompt"
+        tokenizer.encode.return_value = [98]
+        generator = Mock()
+        generator.insert.return_value = [7]
+        generator.next_generated.return_value = []
+        with patch("mlx_lm.generate.BatchGenerator", return_value=generator):
+            with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                predict_batch(Mock(), tokenizer, [{"command": "Undo", "canvas": {}}])
+        generator.close.assert_called_once()
+
+    def test_batched_evaluation_keeps_the_last_partial_batch_and_report_order(self):
+        from lab import evaluate
+
+        expected = {"name": "no_action", "arguments": {"reason": "unsupported"}}
+        examples = [
+            {
+                "id": f"case-{index}",
+                "split": "valid",
+                "command": "Explain this diagram.",
+                "canvas": {},
+                "expected": expected,
+            }
+            for index in range(5)
+        ]
+        results = [
+            {
+                "raw_output": "<start_function_call>call:no_action",
+                "prediction": copy.deepcopy(expected) if index != 3 else None,
+                "error": None if index != 3 else "Incomplete function call.",
+                "seconds": 0.1,
+                "peak_model_memory_gb": 1.0,
+            }
+            for index in range(5)
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("lab.prepare_data"),
+            patch("lab.load_model", return_value=(Mock(), Mock())),
+            patch("lab.read_examples", return_value=examples),
+            patch("lab._metadata", return_value={}),
+            patch("lab.predict_batch", side_effect=[results[:4], results[4:]]),
+        ):
+            output = Path(directory) / "valid.json"
+            evaluate(
+                argparse.Namespace(
+                    adapter=None,
+                    split="valid",
+                    limit=None,
+                    output=output,
+                    batch_size=4,
+                )
+            )
+            report = json.loads(output.read_text())
+        self.assertEqual(
+            [row["id"] for row in report["examples"]],
+            [f"case-{index}" for index in range(5)],
+        )
+        self.assertEqual((report["total"], report["correct"]), (5, 4))
+        self.assertEqual(report["exact_action_accuracy"], 0.8)
 
 
 if __name__ == "__main__":

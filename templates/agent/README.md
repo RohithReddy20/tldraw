@@ -130,7 +130,16 @@ pass: a 12-command editing session with manual dragging and undo/redo, and synth
 speech through Parakeet to a schema edit. The first attempt hit a transient browser
 helper error and an idle-sleep timeout; rerunning the unchanged tests with the Mac
 awake passed. The native check now prevents idle sleep only while its browser tests
-run. Broad accuracy for this refined model is still pending.
+run.
+
+Final scoring completed and all six reports match the retained adapter, dataset,
+and task hashes. Guarded validation is 1,058/1,200 (88.17%). The fresh test set is
+2,163/2,880 (75.10%); action accuracy across 1,440 simulated session turns is 67.15%.
+Exact canvas state agreement is 10.56%, with no completely correct test sessions.
+Passing the short native tests therefore does not establish reliable long-session
+editing. The frozen evaluation made 7,680 predictions on two T4s in about 1 hour
+55 minutes, without prefix reuse; guarded independent tests had a 1.56-second
+median. Reports are retained under `training/runs/kaggle/spoken/final-score/`.
 
 A separate continuation waits for the native tests to pass before
 launching selected-model scoring on Kaggle: raw and guarded validation, plus guarded
@@ -175,9 +184,18 @@ Both `evaluate` and `evaluate-sessions` accept `--cache-prefix` to reuse the fir
 state; changing the canvas or recent history still recomputes the remaining prompt.
 The original prefill boundaries and greedy decoding are retained. In 36 training
 probes covering all 18 tools on Apple Silicon, raw outputs and validated actions
-matched exactly; median time fell from 0.92 to 0.55 seconds. CUDA measurements run
-separately from the current frozen accuracy job. This is a speed check, not a new
-accuracy measurement.
+matched exactly; median time fell from 0.92 to 0.55 seconds.
+
+Independent command evaluation also accepts `--batch-size 8`. A same-T4 check of
+36 training probes increased throughput from 0.73 to 4.03 commands per second
+(5.56 times), with average GPU activity rising from 22.6% to 55.8% and maximum sampled
+GPU memory from 1,919 to 4,847 MiB. Batches of four and eight both retained exact raw
+outputs, validated actions, and errors across those probes and 64 existing validation
+cases covering all 18 actions. New Kaggle validation and selected-model scoring jobs
+reuse the prefix and batch eight independent commands. Session turns retain their
+sequence and reuse only the prefix. These are speed and output checks, not new
+accuracy measurements or a measurement of peak GPU capacity. The completed full
+accuracy reports retain the original evaluator.
 
 Run these commands from the monorepo root. Install
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if it is missing.

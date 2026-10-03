@@ -516,8 +516,12 @@ def predict(
         "first_token_seconds": first_token,
         "peak_model_memory_gb": mx.get_peak_memory() / 1e9,
     }
+    return _validate_prediction(result, command, canvas, history, guarded)
+
+
+def _validate_prediction(result, command, canvas, history, guarded):
     try:
-        result["prediction"] = parse_call(text, canvas)
+        result["prediction"] = parse_call(result["raw_output"], canvas)
         result["error"] = None
     except ValueError as error:
         result["prediction"] = None
@@ -539,6 +543,80 @@ def predict(
     return result
 
 
+def predict_batch(
+    model, tokenizer, examples, max_tokens=256, *, guarded=False, prefix_cache=None
+):
+    import mlx.core as mx
+    from mlx_lm.generate import BatchGenerator
+    from mlx_lm.sample_utils import make_sampler
+
+    if not examples:
+        return []
+    mx.reset_peak_memory()
+    start = time.perf_counter()
+    prompts, caches = [], []
+    for example in examples:
+        prompt = tokenizer.apply_chat_template(
+            messages_for(example["command"], example["canvas"], example.get("history")),
+            tools=TOOLS,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        if prefix_cache is None:
+            tokens = tokenizer.encode(
+                prompt,
+                add_special_tokens=tokenizer.bos_token is None
+                or not prompt.startswith(tokenizer.bos_token),
+            )
+            cache = None
+        else:
+            tokens, cache = prefix_cache.prepare(model, tokenizer, prompt)
+        prompts.append(tokens)
+        caches.append(cache)
+    eos = set(tokenizer.eos_token_ids)
+    generator = BatchGenerator(
+        model,
+        max_tokens=max_tokens,
+        stop_tokens=[
+            *[[token] for token in eos],
+            tokenizer.encode("<end_function_call>", add_special_tokens=False),
+        ],
+        sampler=make_sampler(temp=0),
+        completion_batch_size=len(examples),
+        prefill_batch_size=len(examples),
+    )
+    try:
+        uids = generator.insert(prompts, caches=caches)
+        output = {uid: [] for uid in uids}
+        timing = {uid: {} for uid in uids}
+        while responses := generator.next_generated():
+            elapsed = time.perf_counter() - start
+            for response in responses:
+                timing[response.uid].setdefault("first_token_seconds", elapsed)
+                if response.token not in eos:
+                    output[response.uid].append(response.token)
+                if response.finish_reason is not None:
+                    timing[response.uid]["seconds"] = elapsed
+        if any("seconds" not in timing[uid] for uid in uids):
+            raise RuntimeError("A batched command did not finish generation.")
+        return [
+            _validate_prediction(
+                {
+                    "raw_output": tokenizer.decode(output[uid]),
+                    **timing[uid],
+                    "peak_model_memory_gb": mx.get_peak_memory() / 1e9,
+                },
+                example["command"],
+                example["canvas"],
+                example.get("history"),
+                guarded,
+            )
+            for uid, example in zip(uids, examples, strict=True)
+        ]
+    finally:
+        generator.close()
+
+
 def evaluate(args):
     prepare_data(write_rows=False)
     model, tokenizer = load_model(args.adapter)
@@ -550,28 +628,44 @@ def evaluate(args):
     examples = [e for e in read_examples() if e["split"] == args.split]
     if args.limit:
         examples = examples[: args.limit]
+    batch_size = getattr(args, "batch_size", 1)
+    if batch_size < 1:
+        raise ValueError("Evaluation batch size must be positive.")
     rows = []
-    for i, example in enumerate(examples):
-        result = predict(
-            model,
-            tokenizer,
-            example["command"],
-            example["canvas"],
-            history=example.get("history"),
-            guarded=getattr(args, "guarded", False),
-            prefix_cache=prefix_cache,
+    start = time.perf_counter()
+    for offset in range(0, len(examples), batch_size):
+        batch = examples[offset : offset + batch_size]
+        options = {
+            "guarded": getattr(args, "guarded", False),
+            "prefix_cache": prefix_cache,
+        }
+        results = (
+            predict_batch(model, tokenizer, batch, **options)
+            if batch_size > 1
+            else [
+                predict(
+                    model,
+                    tokenizer,
+                    batch[0]["command"],
+                    batch[0]["canvas"],
+                    history=batch[0].get("history"),
+                    **options,
+                )
+            ]
         )
-        result.update(
-            {
-                "id": example["id"],
-                "command": example["command"],
-                "expected": example["expected"],
-            }
-        )
-        result["correct"] = result["prediction"] == result["expected"]
-        rows.append(result)
-        status = "correct" if result["correct"] else "incorrect"
-        print(f"{i + 1}/{len(examples)} {example['id']}: {status}", flush=True)
+        for example, result in zip(batch, results, strict=True):
+            result.update(
+                {
+                    "id": example["id"],
+                    "command": example["command"],
+                    "expected": example["expected"],
+                }
+            )
+            result["correct"] = result["prediction"] == result["expected"]
+            rows.append(result)
+            status = "correct" if result["correct"] else "incorrect"
+            print(f"{len(rows)}/{len(examples)} {example['id']}: {status}", flush=True)
+    elapsed = time.perf_counter() - start
     report = _summarize(rows)
     report.update(
         {
@@ -582,6 +676,9 @@ def evaluate(args):
             "evaluation_max_tokens": 256,
             "execution_guards": getattr(args, "guarded", False),
             "cached_prompt_tokens": len(prefix_cache.tokens) if prefix_cache else 0,
+            "batch_size": batch_size,
+            "elapsed_seconds": elapsed,
+            "examples_per_second": len(rows) / elapsed,
         }
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -737,6 +834,7 @@ def main():
     evaluation.add_argument("--output", type=Path, required=True)
     evaluation.add_argument("--guarded", action="store_true")
     evaluation.add_argument("--cache-prefix", action="store_true")
+    evaluation.add_argument("--batch-size", type=positive_integer, default=1)
     session_evaluation = commands.add_parser("evaluate-sessions")
     session_evaluation.add_argument("--adapter", type=Path, required=True)
     session_evaluation.add_argument(
