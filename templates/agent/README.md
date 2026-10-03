@@ -249,10 +249,30 @@ report black, matching the native shape utilities. The guard now excludes quoted
 captions and explicitly cancelled clauses when checking for extra edits or stale
 history references. Native browser checks cover note and frame contexts and moves
 targeting a child of a group. Full geometry and zoom-to-fit remain simulated
-approximations. This supplement has not been trained; its accuracy gain is unknown.
+approximations. The completed version-eight run below trained this supplement,
+but no checkpoint passed the replacement gate.
 Independent semantic review corrected 54 unavailable undo/redo refusal reasons to
 `missing_target`. All 2,808 final inputs pass function-call token round trips;
 the longest input is 4,326 tokens within the 6,144-token sequence limit.
+
+`build_workflow.py --lexical-refinement --output training/runs/quality-next/lexical-refinement-v1 --seed 72`
+creates a separate ordinary-English refinement with 1,200 training and 200
+development rows. These are generated state variants from 132 authored training
+sentence structures and 66 withheld development structures, not 1,400 independent
+human conversations. Twenty training and four development conversations each
+contain twelve turns. They create and refine real simulated objects, change
+selection, refer to earlier edits, recover a deletion, and distinguish an actual
+wrong action from a rejected request. Contrast pairs cover undo versus redo,
+zoom versus pan, deselection versus deletion, attributes, movement directions,
+rotation, singular and plural references, names, and literal captions.
+
+Full-input uniqueness, canonical labels, native capabilities, setup receipts,
+conversation replay, guard equivalence, and function-call token round trips are
+checked before export. The development wording is separate from training, and
+the existing reserved test is preserved. Current target guards reject singular
+references that would edit multiple shapes while preserving named antecedents,
+fields, plural requests, corrections, and available undo/redo. These data and
+guard checks do not establish model accuracy on spontaneous human speech.
 
 The workflow follows Google's [FunctionGemma fine-tuning guidance](https://ai.google.dev/gemma/docs/functiongemma/finetuning-with-functiongemma).
 The [APIGen paper](https://arxiv.org/abs/2406.18518) provides a reference for checking
@@ -867,8 +887,30 @@ selection gate. The chosen checkpoint then faces separate full original and
 supplement development gates, including per-action regressions and document,
 selection, and camera state. Native SDK checks must pass for the exact downloaded
 adapter before scoring the reserved test set. If any gate fails, the retained
-baseline remains selected. Preparation and throughput measurements do not
-establish improved accuracy; that requires the completed validation reports.
+baseline remains selected.
+
+The run completed all 3,900 updates from source commit `86496a865` in 3,201 seconds
+including warmup and checkpoint saves. All weights remained finite. Median steady
+speed was 1.393 optimizer updates per second; elapsed speed was 1.218. Recorded
+GPU activity averaged 46.16% and peak VRAM was 13,943 MiB. This is not peak H100
+utilization. The GPU app is stopped.
+
+On the fixed original development subset, the frozen runtime reported:
+
+| Adapter              | Commands, 256 | Session actions, 192 | Complete state matches, 192 |
+| -------------------- | ------------- | -------------------- | --------------------------- |
+| Retained version six | 78.52%        | 33.33%               | 2.60%                       |
+| Update 650           | 90.63%        | 48.96%               | 3.65%                       |
+| Update 1,950         | 91.41%        | 60.94%               | 17.71%                      |
+| Update 3,900         | 90.63%        | 57.81%               | 17.71%                      |
+
+Every candidate regressed on undo, zoom-out, and ambiguous-target cases, so the
+retained adapter remains selected. No full development, native replacement, or
+fresh test scoring was run. No complete session finished with the expected final
+state. These scores use the original version-eight guard; subsequent guard
+changes require a new paired evaluation. Billing receipts show approximately
+$5.8 total metered usage across the completed Modal experiments, covered by
+credits with zero cash charges at the recorded check.
 
 #### Accuracy trial for the faster trainer
 

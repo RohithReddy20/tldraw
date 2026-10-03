@@ -3960,6 +3960,1177 @@ def build_quality_supplement(
     return summary
 
 
+LEXICAL_NAMES = {
+    "train": [
+        "Delivery manifest",
+        "Inventory ledger",
+        "Route marker",
+        "Package tile",
+        "Dispatch label",
+        "Handover note",
+        "Dock frame",
+    ],
+    "valid": [
+        "Reading list",
+        "Archive catalogue",
+        "Shelf marker",
+        "Index tile",
+        "Research label",
+        "Reading note",
+        "Study frame",
+    ],
+}
+
+# Development uses independently authored sentence structures, not filled-in
+# versions of training templates; state variations are counted separately.
+LEXICAL_PAIRS = {
+    "undo_redo": [
+        (
+            "I preferred it before that edit. Could you revert the last canvas change?",
+            (
+                "I have changed my mind about the undo. Could you reapply that "
+                "canvas change?"
+            ),
+        ),
+        (
+            "Um, please take the drawing back by one edit.",
+            "Um, please put back the edit that I just undid.",
+        ),
+        (
+            "That latest change was a mistake; would you reverse it for me?",
+            "The change I undid was fine; would you restore that edit for me?",
+        ),
+        (
+            "Please redo the edit. No, instead, undo the most recent edit.",
+            "Please undo the edit. No, instead, redo the edit I reversed.",
+        ),
+        (
+            "Return the document to its preceding editing state, please.",
+            (
+                "Advance the document to the editing state available after an "
+                "undo, please."
+            ),
+        ),
+        (
+            "Could we roll back the latest alteration to the drawing?",
+            "Could we repeat the alteration that was rolled back?",
+        ),
+    ],
+    "undo_availability": [
+        ("Could you revert the most recent alteration, please?",) * 2,
+        ("That change is not what I wanted. Please undo it.",) * 2,
+        ("Um, can you take back the last edit on the canvas?",) * 2,
+        ("I would like the previous version of the drawing back, one undo please.",)
+        * 2,
+        ("Reverse the newest document modification for me, would you?",) * 2,
+        ("Please step back once through the document's editing history.",) * 2,
+    ],
+    "redo_availability": [
+        ("Could you reapply the edit that was undone, please?",) * 2,
+        ("Actually, I want that undone change back. Please redo it.",) * 2,
+        ("Um, can you restore the edit I reversed?",) * 2,
+        ("Go forward one edit in the undo history for me, please.",) * 2,
+        ("Repeat the document modification that I rolled back, would you?",) * 2,
+        ("Please step forward once through the document's editing history.",) * 2,
+    ],
+    "zoom_pan": [
+        (
+            "The view feels too close. Could you move the viewpoint further away?",
+            (
+                "The view is too far left. Could you pan the viewport right by "
+                "{distance} page units?"
+            ),
+        ),
+        (
+            "Um, please zoom out so the diagram looks smaller.",
+            "Um, please slide the canvas view right by {distance} page units.",
+        ),
+        (
+            "Bring the view closer. No, instead, zoom out one step.",
+            "Bring the view closer. No, instead, pan right by {distance} page units.",
+        ),
+        (
+            "Could you pull back the view so I can see more of the diagram?",
+            "Could you shift the viewport right by {distance} page units for me?",
+        ),
+        (
+            "Give me a wider view by decreasing the magnification, please.",
+            "Translate the camera rightward by {distance} page units, please.",
+        ),
+        (
+            "The drawing should appear smaller on screen; take the view farther back.",
+            "The camera should travel {distance} page units to the right.",
+        ),
+    ],
+    "zoom_out_in": [
+        (
+            "Would you take the view further away from the drawing?",
+            "Would you bring the view closer to the drawing?",
+        ),
+        (
+            "I need to see more around the diagram, so please zoom out.",
+            "I need to see the diagram in more detail, so please zoom in.",
+        ),
+        (
+            "Um, make the drawing look smaller by reducing the zoom.",
+            "Um, make the drawing look larger by increasing the zoom.",
+        ),
+        (
+            "Please pull the viewpoint back one zoom step.",
+            "Please push the viewpoint in one zoom step.",
+        ),
+        (
+            "Decrease the view magnification by one step, if you could.",
+            "Increase the view magnification by one step, if you could.",
+        ),
+        (
+            "Widen what the screen shows by zooming outward.",
+            "Narrow what the screen shows by zooming inward.",
+        ),
+    ],
+    "clear_delete": [
+        (
+            "I am done choosing those shapes. Could you clear the selection?",
+            "I am done using those shapes. Could you delete the selected objects?",
+        ),
+        (
+            "Um, please deselect everything that is highlighted.",
+            "Um, please remove everything that is highlighted from the drawing.",
+        ),
+        (
+            "Delete the chosen shapes. No, instead, just unselect them.",
+            "Unselect the chosen shapes. No, instead, delete them.",
+        ),
+        (
+            "Could you leave the chosen shapes in place and release the selection?",
+            "Could you get rid of all the chosen shapes on the canvas?",
+        ),
+        (
+            "Drop the active selection while retaining the objects, please.",
+            "Erase the objects in the active selection, please.",
+        ),
+        (
+            "Remove the selection highlight from those objects for me.",
+            "Remove those highlighted objects themselves from the document for me.",
+        ),
+    ],
+    "property_remove_add": [
+        (
+            "We do not need the {field} attribute in {schema}; could you remove it?",
+            "We need a new attribute called {new_field} in {schema}; could you add it?",
+        ),
+        (
+            "Um, please drop the {field} property from {schema}.",
+            "Um, please give {schema} an additional property called {new_field}.",
+        ),
+        (
+            "Could you take {field} out of the attributes of {schema}?",
+            "Could you include {new_field} among the attributes of {schema}?",
+        ),
+        (
+            (
+                "Add a field. No, instead, remove the existing {field} field "
+                "from {schema}."
+            ),
+            "Remove a field. No, instead, add a field named {new_field} to {schema}.",
+        ),
+        (
+            (
+                "The schema {schema} should stop listing {field} as a member; "
+                "please delete that attribute."
+            ),
+            (
+                "The schema {schema} should list one more member; please insert"
+                " the attribute {new_field}."
+            ),
+        ),
+        (
+            "Prune the {field} field belonging to {schema}, would you?",
+            "Extend {schema} with the field {new_field}, would you?",
+        ),
+    ],
+    "missing_field": [
+        (
+            "Could you remove the attribute {new_field} from {schema}?",
+            "Could you create the attribute {new_field} in {schema}?",
+        ),
+        (
+            "Um, drop the {new_field} field from {schema}, please.",
+            "Um, add the {new_field} field to {schema}, please.",
+        ),
+        (
+            "I no longer need {new_field} listed in {schema}; take that attribute out.",
+            "I need {new_field} listed in {schema}; put that attribute in.",
+        ),
+        (
+            "Please remove the property named {new_field} belonging to {schema}.",
+            "Please introduce a property named {new_field} belonging to {schema}.",
+        ),
+        (
+            "Delete {new_field} from the members of {schema}, if it exists.",
+            "Insert {new_field} into the members of {schema}.",
+        ),
+        (
+            "Would you subtract the {new_field} attribute from {schema}?",
+            "Would you extend {schema} by the {new_field} attribute?",
+        ),
+    ],
+    "direction_bearing": [
+        (
+            "Could you move {name} towards the {direction} by {distance} page units?",
+            "Could you rotate {name} to a bearing of {bearing} degrees?",
+        ),
+        (
+            "Um, translate {name} {distance} page units due {direction}, please.",
+            (
+                "Um, turn {name} so its orientation has a bearing of {bearing} "
+                "degrees, please."
+            ),
+        ),
+        (
+            (
+                "I need {name} {distance} page units farther {direction}; "
+                "please shift it there."
+            ),
+            (
+                "I need {name} facing a bearing of {bearing} degrees; please "
+                "rotate it there."
+            ),
+        ),
+        (
+            (
+                "Move {name} east. No, instead, move it {direction} by "
+                "{distance} page units."
+            ),
+            (
+                "Move {name} east. No, instead, rotate it to a bearing of "
+                "{bearing} degrees."
+            ),
+        ),
+        (
+            (
+                "Displace the shape called {name} by {distance} page units in "
+                "the {direction} direction."
+            ),
+            "Orient the shape called {name} at {bearing} degrees bearing.",
+        ),
+        (
+            (
+                "Please shift {name} {direction} by exactly {distance} page "
+                "units on the page."
+            ),
+            "Please change the rotational bearing of {name} to {bearing} degrees.",
+        ),
+    ],
+    "singular_plural": [
+        (
+            "Could you move the chosen shape right by {distance} page units?",
+            "Could you move all the chosen shapes right by {distance} page units?",
+        ),
+        (
+            "Um, shift it right by {distance} page units, please.",
+            "Um, shift them all right by {distance} page units, please.",
+        ),
+        (
+            "Please nudge this one to the right by {distance} page units.",
+            (
+                "Please nudge every highlighted object to the right by "
+                "{distance} page units."
+            ),
+        ),
+        (
+            (
+                "Would you move the single selected object {distance} page "
+                "units to the right?"
+            ),
+            "Would you move every selected object {distance} page units to the right?",
+        ),
+        (
+            "Translate the one shape I have chosen rightward by {distance} page units.",
+            (
+                "Translate the complete set of shapes I have chosen rightward "
+                "by {distance} page units."
+            ),
+        ),
+        (
+            "Can you push that one {distance} page units rightward for me?",
+            "Can you push all of those {distance} page units rightward for me?",
+        ),
+    ],
+    "duplicate_name": [
+        (
+            (
+                "Could you move the shape named {name} towards the west by "
+                "{distance} page units?"
+            ),
+        )
+        * 2,
+        ("Um, delete the object called {name}, please.",) * 2,
+        ("Would you set the caption of {name} to {payload}?",) * 2,
+        ("Please shift {name} north by {distance} page units.",) * 2,
+        ("Displace the object labelled {name} leftward by {distance} page units.",) * 2,
+        ("Erase the object bearing the name {name} for me.",) * 2,
+    ],
+    "caption_action": [
+        (
+            "Could you put the words {literal} on {text}?",
+            "Could you revert the last document edit?",
+        ),
+        (
+            "Um, change the caption on {text} to exactly {literal}, please.",
+            "Um, take back the most recent document change, please.",
+        ),
+        (
+            "Please write {literal} as the text of {text}.",
+            "Please undo the latest canvas modification.",
+        ),
+        (
+            "I want {text} to say {literal}; replace its caption with those words.",
+            "I want the previous canvas state back; reverse one document edit.",
+        ),
+        (
+            (
+                "Replace the lettering belonging to {text} with the literal "
+                "caption {literal}."
+            ),
+            "Roll back a single document change.",
+        ),
+        (
+            (
+                "The displayed wording of {text} should be {literal}; set its "
+                "text accordingly."
+            ),
+            "Restore the document state immediately before its latest change.",
+        ),
+    ],
+}
+
+LEXICAL_MICRO_TEMPLATES = [
+    [
+        "Could you add a rectangle with the caption {card}, please?",
+        "Um, make a rectangular box that says {card}.",
+        "I need a rectangle labelled {card}; could you draw one?",
+        "Please put a new rectangle on the canvas with the words {card}.",
+        "Introduce a rectangular shape bearing the text {card} for me.",
+        "A new rectangle should display {card}; please create it.",
+    ],
+    [
+        "Could you move the box you added east by {distance} page units?",
+        "Um, shift that newly added box towards the east by {distance} page units.",
+        (
+            "Please move the rectangle you just created {distance} page "
+            "units to the right."
+        ),
+        "The box you made needs to go east by {distance} page units; move it there.",
+        (
+            "Displace the rectangle from your preceding reply rightward by "
+            "{distance} page units."
+        ),
+        "Translate the most recently created rectangle {distance} page units eastward.",
+    ],
+    [
+        "Could you replace its caption with the exact words {caption}?",
+        "Um, I want it to say {caption}; please change its text.",
+        "Please give the chosen rectangle the caption {caption}.",
+        "The text on it should be {caption}; could you update that?",
+        "Set the lettering of that one to the literal string {caption}.",
+        "Use {caption} as the text displayed by the current single selection.",
+    ],
+    [
+        (
+            "Move it north by {distance}. No, instead, move it west by "
+            "{distance} page units."
+        ),
+        (
+            "Um, shift it right by {distance}. I mean, shift it left by "
+            "{distance} page units."
+        ),
+        (
+            "Move the chosen shape east by {distance}. Scratch that; move "
+            "it west by {distance} page units."
+        ),
+        (
+            "Push it down by {distance}. No, cancel that; push it left by "
+            "{distance} page units."
+        ),
+        (
+            "Translate that one north by {distance}. Actually, displace it "
+            "west by {distance} page units."
+        ),
+        (
+            "Move it to the east by {distance}. Forget that; move it to the"
+            " west by {distance} page units."
+        ),
+    ],
+    [
+        "Could you delete the chosen shape now?",
+        "Um, please remove it from the canvas.",
+        "I no longer need this rectangle; delete it, please.",
+        "Please get rid of the object I have selected.",
+        "Erase the current single selection from the document.",
+        "The highlighted rectangle should be removed; please delete that object.",
+    ],
+    [
+        "That deletion was a mistake. Could you revert it?",
+        "Um, I still need that box; undo the deletion, please.",
+        "Please take back the deletion and restore the rectangle.",
+        "I changed my mind about removing it; could you undo that?",
+        "Reverse the preceding deletion so the removed object returns.",
+        "Roll back the removal you just performed.",
+    ],
+    [
+        (
+            "Could you move the restored box {caption} towards the south by"
+            " {distance} page units?"
+        ),
+        "Um, shift {caption} down by {distance} page units now that it is back.",
+        (
+            "Please move {caption}, the rectangle we recovered, south by "
+            "{distance} page units."
+        ),
+        (
+            "The recovered rectangle called {caption} needs to go down by "
+            "{distance} page units."
+        ),
+        (
+            "Displace the recovered object labelled {caption} southward by "
+            "{distance} page units."
+        ),
+        (
+            "Translate the restored object {caption} exactly {distance} "
+            "page units downward."
+        ),
+    ],
+    [
+        "Could you reapply the edit that we undid?",
+        "Um, redo that undone deletion, please.",
+        "Please go forward to the edit that was reversed.",
+        "I want the undone change back; could you redo it?",
+        "Repeat the modification that was rolled back earlier.",
+        "Advance the document by redoing the reversed edit.",
+    ],
+    [
+        "Could you make the box you added blue, please?",
+        "Um, color the rectangle you created blue.",
+        "Please give the box you made a blue color.",
+        "The rectangle you added should be blue; update its color.",
+        "Apply blue coloring to the most recently created rectangle.",
+        "Set the color of your newly created box to blue.",
+    ],
+    [
+        "Could you move {caption} east by {distance} page units?",
+        "Um, push the rectangle named {caption} right by {distance} page units.",
+        (
+            "Please shift the object called {caption} towards the east by "
+            "{distance} page units."
+        ),
+        "I need {caption} {distance} page units farther right; please move it.",
+        "Displace the object labelled {caption} eastward by {distance} page units.",
+        (
+            "Translate the object bearing the name {caption} exactly "
+            "{distance} page units rightward."
+        ),
+    ],
+    [
+        (
+            "I changed its caption myself. Could you move {manual} east by "
+            "{distance} page units?"
+        ),
+        (
+            "Um, its current label is {manual}; shift that box right by "
+            "{distance} page units."
+        ),
+        (
+            "The box is now called {manual} after my edit; please move it "
+            "east by {distance} page units."
+        ),
+        (
+            "Please move {manual}, the rectangle I renamed, right by "
+            "{distance} page units."
+        ),
+        (
+            "Following my manual rename, translate {manual} eastward by "
+            "{distance} page units."
+        ),
+        (
+            "Displace the rectangle with the current name {manual} "
+            "rightward by {distance} page units."
+        ),
+    ],
+    [
+        "Could you take the view further away so I can see the whole area better?",
+        "Um, please pull the view back by one zoom step.",
+        "I need a wider view around the drawing; please zoom out.",
+        "Please make the diagram appear smaller by reducing the zoom.",
+        "Decrease the camera magnification for a wider view of the document.",
+        "Take the viewpoint farther back from the drawing by zooming outward.",
+    ],
+]
+
+
+def lexical_context(rng, split, group):
+    session, ids = quality_context(rng, split, group)
+    for key, name in zip(ids, LEXICAL_NAMES[split], strict=True):
+        shape = session.objects()[ids[key]]
+        shape["name"] = f"{name} {group.rsplit('-', 1)[-1]}"
+        if "text" in shape:
+            shape["text"] = shape["name"]
+    return session, ids
+
+
+def lexical_pair(rng, split, index, family):
+    group = f"lexical-{split}-pair-{index}"
+    base, ids = lexical_context(rng, split, group)
+    sessions = [copy.deepcopy(base), copy.deepcopy(base)]
+    receipts = [
+        {
+            "id": f"{group}:{side}",
+            "initial_canvas": copy.deepcopy(base.canvas),
+            "events": [],
+        }
+        for side in range(2)
+    ]
+    cycle = index // len(LEXICAL_PAIRS)
+    slot = cycle % 4 if split == "train" else 4 + cycle % 2
+    templates = LEXICAL_PAIRS[family][slot]
+    distance = rng.choice([25, 40, 60, 80, 120])
+    direction, dx, dy, bearing = (
+        ("east", distance, 0, 90),
+        ("west", -distance, 0, 270),
+        ("north", 0, -distance, 0),
+        ("south", 0, distance, 180),
+    )[(cycle // 4) % 4]
+    a, b, schema = ids["geo"], ids["other-geo"], ids["box"]
+    objects = base.objects()
+    literal = (
+        "Revert and reapply; choose it",
+        "Add attributes and remove subjects",
+        "Move west and delete the chosen shape",
+        "The box you added; undo and redo",
+        "Rotate to a bearing and remove the selection",
+        "Pan towards the east and zoom out",
+    )[slot]
+    if cycle % 4 == 0:
+        literal = objects[a]["name"]
+    values = {
+        "name": json.dumps(objects[a]["name"]),
+        "schema": json.dumps(objects[schema]["name"]),
+        "text": json.dumps(objects[ids["text"]]["name"]),
+        "field": json.dumps("subjects"),
+        "new_field": json.dumps(
+            objects[a]["name"]
+            if cycle % 4 == 2
+            else "deliveryZone"
+            if split == "train"
+            else "shelfCode"
+        ),
+        "payload": json.dumps(
+            f"{'Departures' if split == 'train' else 'References'} {index}"
+        ),
+        "literal": json.dumps(literal),
+        "direction": direction,
+        "distance": distance,
+        "bearing": bearing,
+    }
+    commands = [template.format(**values) for template in templates]
+    reference = "named"
+    missing, ambiguous, unsupported = (
+        call("no_action", reason=reason)
+        for reason in ("missing_target", "ambiguous_target", "unsupported_request")
+    )
+
+    def outcome(side, command, action, *, wrong=False):
+        created = quality_setup_outcome(sessions[side], receipts[side], command, action)
+        receipts[side]["events"][-1]["outcome_class"] = (
+            "rejected"
+            if action is None
+            else "simulated_wrong_action"
+            if wrong
+            else "oracle_setup_action"
+        )
+        return created
+
+    def both_outcome(command, action, *, wrong=False):
+        for side in range(2):
+            outcome(side, command, action, wrong=wrong)
+
+    if family == "undo_redo":
+        both_outcome(
+            f"Move {values['name']} right by {distance} page units.",
+            call("move_shapes", shape_ids=[b], dx=distance, dy=0),
+            wrong=True,
+        )
+        both_outcome(
+            f"Move {values['name']} down by {distance} page units.",
+            call("move_shapes", shape_ids=[a], dx=0, dy=distance),
+        )
+        both_outcome("Undo the latest edit.", call("canvas_command", operation="undo"))
+        actions = [call("canvas_command", operation=op) for op in ("undo", "redo")]
+        reference = "actual_history"
+    elif family == "undo_availability":
+        prior = f"Delete {values['name']}."
+        outcome(0, prior, call("delete_shapes", shape_ids=[b]), wrong=True)
+        outcome(1, prior, None)
+        actions = [call("canvas_command", operation="undo"), missing]
+        reference = "actual_history"
+    elif family == "redo_availability":
+        both_outcome(
+            f"Move {values['name']} right by {distance} page units.",
+            call("move_shapes", shape_ids=[a], dx=distance, dy=0),
+        )
+        both_outcome("Undo that edit.", call("canvas_command", operation="undo"))
+        quality_setup_manual(
+            sessions[1],
+            receipts[1],
+            [{"kind": "move", "id": b, "dx": 0, "dy": distance}],
+        )
+        actions = [call("canvas_command", operation="redo"), missing]
+        reference = "actual_history"
+    elif family == "zoom_pan":
+        both_outcome(
+            f"Pan the view right by {distance} page units.",
+            call("canvas_command", operation="zoom_in"),
+            wrong=True,
+        )
+        actions = [
+            call("canvas_command", operation="zoom_out"),
+            call("pan_canvas", dx=distance, dy=0),
+        ]
+        reference = "viewport"
+    elif family == "zoom_out_in":
+        actions = [
+            call("canvas_command", operation=op) for op in ("zoom_out", "zoom_in")
+        ]
+        reference = "viewport"
+    elif family == "clear_delete":
+        both_outcome(
+            "Select both drawing shapes.",
+            call("select_shapes", shape_ids=sorted([a, b])),
+        )
+        actions = [
+            call("canvas_command", operation="clear_selection"),
+            call("delete_shapes", shape_ids=sorted([a, b])),
+        ]
+        reference = "plural_selected"
+    elif family in ("property_remove_add", "missing_field"):
+        field = json.loads(values["new_field"])
+        both_outcome(
+            f"Please add the attribute {values['new_field']} to {values['schema']}.",
+            None,
+        )
+        actions = [
+            call("remove_property", schema_id=schema, property_name="subjects")
+            if family == "property_remove_add"
+            else missing,
+            call("add_property", schema_id=schema, property_name=field),
+        ]
+        reference = "current_schema_attributes"
+    elif family == "direction_bearing":
+        both_outcome(
+            f"Move {values['name']} right by {distance} page units.",
+            call("move_shapes", shape_ids=[b], dx=distance, dy=0),
+            wrong=True,
+        )
+        if slot == 3:
+            # A cancelled named clause does not resolve the final singular 'it'.
+            for side in range(2):
+                quality_setup_manual(
+                    sessions[side], receipts[side], [{"kind": "select", "ids": [a]}]
+                )
+        actions = [call("move_shapes", shape_ids=[a], dx=dx, dy=dy), unsupported]
+    elif family == "singular_plural":
+        targets = sorted([a, b])
+        both_outcome(
+            f"Move {values['name']} right by {distance} page units.",
+            call("move_shapes", shape_ids=[b], dx=distance, dy=0),
+            wrong=True,
+        )
+        both_outcome(
+            "Choose the two drawing shapes.", call("select_shapes", shape_ids=targets)
+        )
+        both_outcome("Move the chosen shape east, please.", None)
+        selected = targets if cycle % 3 == 0 else [a]
+        quality_setup_manual(
+            sessions[0], receipts[0], [{"kind": "select", "ids": selected}]
+        )
+        if cycle % 3:
+            templates = (templates[0], templates[0])
+            commands = [commands[0], commands[0]]
+            quality_setup_manual(
+                sessions[1],
+                receipts[1],
+                [{"kind": "select", "ids": targets if cycle % 3 == 1 else []}],
+            )
+        actions = [
+            call("move_shapes", shape_ids=selected, dx=distance, dy=0)
+            if len(selected) == 1
+            else ambiguous,
+            ambiguous
+            if cycle % 3
+            else call("move_shapes", shape_ids=targets, dx=distance, dy=0),
+        ]
+        reference = "singular_vs_plural_selected"
+    elif family == "duplicate_name":
+        prior = f"Rename {json.dumps(objects[b]['name'])} to {values['payload']}."
+        outcome(0, prior, None)
+        outcome(
+            1, prior, call("set_text", shape_id=b, text=objects[a]["name"]), wrong=True
+        )
+        action = (
+            call("delete_shapes", shape_ids=[a])
+            if slot in (1, 5)
+            else call("set_text", shape_id=a, text=json.loads(values["payload"]))
+            if slot == 2
+            else call(
+                "move_shapes",
+                shape_ids=[a],
+                dx=0 if slot == 3 else -distance,
+                dy=-distance if slot == 3 else 0,
+            )
+        )
+        actions = [action, ambiguous]
+        reference = "unique_vs_duplicate_current_name"
+    elif family == "caption_action":
+        both_outcome(
+            f"Delete {json.dumps(objects[b]['name'])}.",
+            call("delete_shapes", shape_ids=[b]),
+        )
+        actions = [
+            call("set_text", shape_id=ids["text"], text=literal),
+            call("canvas_command", operation="undo"),
+        ]
+        reference = "quoted_payload_vs_history"
+    else:
+        raise ValueError(f"Unknown lexical pair family: {family}")
+    rows = []
+    for side, (session, command, action, template) in enumerate(
+        zip(sessions, commands, actions, templates, strict=True)
+    ):
+        row = quality_row(
+            session,
+            command,
+            action,
+            identifier=f"{group}:{side}",
+            group=group,
+            split=split,
+            family=family,
+            wording=f"lexical-{split}-{family}-{slot}-{side}",
+            reference=reference,
+            rationale=(
+                f"Authored {family} semantic contrast; "
+                "current state and actual recorded outcomes determine "
+                "the single action."
+            ),
+        )
+        row["sentence_template"] = template
+        row["provenance"] = (
+            "Authored lexical refinement; simulated state and actual recorded outcomes"
+        )
+        rows.append(row)
+    pair = {
+        "id": group,
+        "split": split,
+        "scenario": family,
+        "example_ids": [row["id"] for row in rows],
+        "same_canvas_and_history": rows[0]["canvas"] == rows[1]["canvas"]
+        and rows[0]["history"] == rows[1]["history"],
+        "same_model_canvas_and_history": messages_for(
+            "", rows[0]["canvas"], rows[0]["history"]
+        )
+        == messages_for("", rows[1]["canvas"], rows[1]["history"]),
+        "same_command": commands[0] == commands[1],
+        "wording_families": [row["wording_family"] for row in rows],
+    }
+    return rows, receipts, pair
+
+
+def lexical_micro_conversation(rng, split, index):
+    group = f"lexical-{split}-conversation-{index}"
+    session, ids = lexical_context(rng, split, group)
+    session.external([{"kind": "select", "ids": []}])
+    initial = copy.deepcopy(session.canvas)
+    slot = index % 4 if split == "train" else 4 + index % 2
+    distance = rng.choice([25, 40, 60, 80, 120])
+    card = f"{'Courier job' if split == 'train' else 'Library job'} {index}"
+    caption = (
+        f"{'Revert and delete' if split == 'train' else 'Zoom and reapply'} {index}"
+    )
+    manual_name = "Hand checked delivery" if split == "train" else "Hand indexed volume"
+    manual = f"{manual_name} {index}"
+    values = {
+        "card": json.dumps(card),
+        "caption": json.dumps(caption),
+        "manual": json.dumps(manual),
+        "distance": distance,
+    }
+    rows, steps = [], []
+    created = f"{group}:created-0"
+    actions = [
+        call("create_shape", kind="rectangle", text=card),
+        call("move_shapes", shape_ids=[created], dx=distance, dy=0),
+        call("set_text", shape_id=created, text=caption),
+        call("move_shapes", shape_ids=[created], dx=-distance, dy=0),
+        call("delete_shapes", shape_ids=[created]),
+        call("canvas_command", operation="undo"),
+        call("move_shapes", shape_ids=[created], dx=0, dy=distance),
+        call("no_action", reason="missing_target"),
+        call("style_shapes", shape_ids=[created], color="blue"),
+        call("no_action", reason="missing_target"),
+        call("move_shapes", shape_ids=[created], dx=distance, dy=0),
+        call("canvas_command", operation="zoom_out"),
+    ]
+    references = [
+        "creation",
+        "last_created",
+        "singular_selected",
+        "singular_selected",
+        "singular_selected",
+        "actual_history",
+        "restored_current_name",
+        "unavailable_redo",
+        "last_created_overrides_selection",
+        "stale_name",
+        "manual_current_name",
+        "viewport",
+    ]
+    for turn, action in enumerate(actions):
+        before = (
+            [{"kind": "select", "ids": [ids["other-geo"]]}]
+            if turn == 8
+            else [{"kind": "text", "id": created, "text": manual}]
+            if turn == 9
+            else []
+        )
+        session.external(before)
+        template = LEXICAL_MICRO_TEMPLATES[turn][slot]
+        command = template.format(**values)
+        row = quality_row(
+            session,
+            command,
+            action,
+            identifier=f"{group}:{turn}",
+            group=group,
+            split=split,
+            family="micro_conversation",
+            wording=f"lexical-{split}-conversation-{slot}-{turn}",
+            reference=references[turn],
+            rationale=(
+                "One conversational edit grounded in the reached state: "
+                "creation, correction, deletion recovery, cleared redo history "
+                "and manual rename are replayed."
+            ),
+        )
+        row["sentence_template"] = template
+        row["provenance"] = (
+            "Authored twelve-turn conversation; oracle actions and recorded"
+            " manual user edits"
+        )
+        rows.append(row)
+        steps.append(
+            {
+                "id": row["id"],
+                "command": command,
+                "expected": row["expected"],
+                "before": before,
+            }
+        )
+        session.execute(command, row["expected"], f"{group}:created-{turn}")
+    return rows, {
+        "id": group,
+        "split": split,
+        "initial_canvas": initial,
+        "turns": steps,
+        "final_snapshot": session.snapshot(),
+        "provenance": rows[0]["provenance"],
+    }
+
+
+def audit_lexical_tokenization(rows, tokenizer_path):
+    from transformers import AutoTokenizer
+
+    from actions import TOOLS, parse_call
+    from dataset import training_row
+    from lab import ToolPrefixEncoder, _task_hash
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(tokenizer_path), local_files_only=True
+    )
+    encoder = ToolPrefixEncoder(tokenizer)
+    lengths, completions, checked_tools = [], [], set()
+    for row in rows:
+        messages = training_row(row)["messages"]
+        full = encoder.encode(messages)
+        prompt = encoder.encode(messages[:-1], generation=True)
+        if full[: len(prompt)] != prompt:
+            raise ValueError(f"Lexical training prompt boundary differs: {row['id']}")
+        parsed = parse_call(tokenizer.decode(full[len(prompt) :]), row["canvas"])
+        if parsed != row["expected"]:
+            raise ValueError(
+                f"Lexical function-call token round trip differs: {row['id']}"
+            )
+        tool = row["expected"]["name"]
+        if tool not in checked_tools:
+            for content, cached, generation in (
+                (messages, full, False),
+                (messages[:-1], prompt, True),
+            ):
+                official = tokenizer.apply_chat_template(
+                    content,
+                    tools=TOOLS,
+                    add_generation_prompt=generation,
+                    tokenize=True,
+                    return_dict=False,
+                )
+                if official != cached:
+                    raise ValueError(
+                        "Cached lexical encoding differs from the official tool "
+                        "template."
+                    )
+            checked_tools.add(tool)
+        if len(full) > 6144 or len(full) - len(prompt) > 160:
+            raise ValueError(
+                f"Lexical row exceeds the training token limits: {row['id']}"
+            )
+        lengths.append(len(full))
+        completions.append(len(full) - len(prompt))
+    return {
+        "round_trips": len(rows),
+        "failures": 0,
+        "max_tokens": max(lengths),
+        "max_completion_tokens": max(completions),
+        "task_sha256": _task_hash(),
+        "official_template_tools_checked": sorted(checked_tools),
+        "tokenizer_sha256": {
+            filename: hashlib.sha256(
+                (tokenizer_path / filename).read_bytes()
+            ).hexdigest()
+            for filename in (
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "chat_template.jinja",
+            )
+        },
+        "execution": "CPU tokenizer only; local cache, no model load or inference",
+    }
+
+
+def build_lexical_refinement(
+    output,
+    *,
+    seed=72,
+    train_pairs=480,
+    dev_pairs=76,
+    train_conversations=20,
+    dev_conversations=4,
+    tokenizer_path=None,
+):
+    if dev_pairs < 6 * len(LEXICAL_PAIRS):
+        raise ValueError(
+            "Both lexical splits must cover every family with independent "
+            "sentence structures."
+        )
+    if (
+        train_pairs < 12 * len(LEXICAL_PAIRS)
+        or train_conversations < 4
+        or dev_conversations < 2
+    ):
+        raise ValueError(
+            "Lexical data must cover all authored training/development "
+            "sentence structures."
+        )
+    if output.exists():
+        raise FileExistsError(output)
+    rows, cases, receipts, pairs = [], [], [], []
+    for split, pair_count, conversation_count, offset in (
+        ("train", train_pairs, train_conversations, 0),
+        ("valid", dev_pairs, dev_conversations, 10000),
+    ):
+        rng = random.Random(seed + offset)
+        for index in range(pair_count):
+            family = list(LEXICAL_PAIRS)[index % len(LEXICAL_PAIRS)]
+            examples, setup, pair = lexical_pair(rng, split, index, family)
+            rows.extend(examples)
+            receipts.extend(setup)
+            pairs.append(pair)
+        for index in range(conversation_count):
+            examples, case = lexical_micro_conversation(rng, split, index)
+            rows.extend(examples)
+            cases.append(case)
+    templates = {
+        split: {row["sentence_template"] for row in rows if row["split"] == split}
+        for split in ("train", "valid")
+    }
+    if templates["train"] & templates["valid"]:
+        raise ValueError(
+            "Lexical training and development sentence structures must be disjoint."
+        )
+    commands = {
+        split: {
+            " ".join(row["command"].casefold().split())
+            for row in rows
+            if row["split"] == split
+        }
+        for split in ("train", "valid")
+    }
+    if commands["train"] & commands["valid"]:
+        raise ValueError("Lexical training and development command sentences overlap.")
+    audit = audit_quality_supplement(rows, cases, receipts, pairs)
+    if audit["guard_reversal_count"]:
+        raise ValueError(
+            f"Lexical execution guard reversals: {json.dumps(audit['guard_reversals'])}"
+        )
+    tokenizer_path = (
+        tokenizer_path or Path(__file__).parent / "runs/base-bb327a9a-float16"
+    )
+    token_audit = audit_lexical_tokenization(rows, tokenizer_path)
+    output.mkdir(parents=True, exist_ok=False)
+    for filename, values in (
+        ("examples.jsonl", rows),
+        ("sessions.jsonl", cases),
+        ("counterfactual-setups.jsonl", receipts),
+        ("contrastive-pairs.jsonl", pairs),
+    ):
+        (output / filename).write_text(
+            "".join(json.dumps(value) + "\n" for value in values)
+        )
+    (output / "data-audit.json").write_text(json.dumps(audit, indent=2))
+    (output / "tokenization-audit.json").write_text(json.dumps(token_audit, indent=2))
+    instruction_syntax = [
+        (row["split"], re.sub(r'"(?:\\.|[^"\\])*"', " ", row["command"]))
+        for row in rows
+    ]
+    summary = {
+        "seed": seed,
+        "status": (
+            "Generated, replayed and CPU-token audited; no model trained or"
+            " accuracy measured"
+        ),
+        "splits": audit["splits"],
+        "unique_full_inputs": audit["unique_full_inputs"],
+        "unique_command_sentences": {split: len(commands[split]) for split in commands},
+        "contrastive_pairs": dict(Counter(pair["split"] for pair in pairs)),
+        "micro_conversations": dict(Counter(case["split"] for case in cases)),
+        "conversation_turns": audit["session_replay_turns"],
+        "pair_scenarios": {
+            split: dict(
+                Counter(pair["scenario"] for pair in pairs if pair["split"] == split)
+            )
+            for split in ("train", "valid")
+        },
+        "authored_sentence_structures": {
+            split: len(templates[split]) for split in templates
+        },
+        "wording_families": {
+            split: len({row["wording_family"] for row in rows if row["split"] == split})
+            for split in ("train", "valid")
+        },
+        "tools": {
+            split: dict(
+                Counter(
+                    row["expected"]["name"] for row in rows if row["split"] == split
+                )
+            )
+            for split in ("train", "valid")
+        },
+        "semantic_terms": {
+            term: dict(
+                Counter(
+                    row["split"]
+                    for row in rows
+                    if re.search(rf"\b{term}\b", row["command"], re.I)
+                )
+            )
+            for term in (
+                "revert",
+                "reapply",
+                "further away",
+                "chosen shape",
+                "towards",
+                "bearing",
+                "attributes",
+            )
+        },
+        "instruction_semantic_terms": {
+            term: dict(
+                Counter(
+                    split
+                    for split, syntax in instruction_syntax
+                    if re.search(rf"\b{term}\b", syntax, re.I)
+                )
+            )
+            for term in (
+                "revert",
+                "reapply",
+                "further away",
+                "chosen shape",
+                "towards",
+                "bearing",
+                "attributes",
+            )
+        },
+        "setup_outcomes": dict(
+            Counter(
+                event["outcome_class"]
+                for receipt in receipts
+                for event in receipt["events"]
+                if event["kind"] == "outcome"
+            )
+        ),
+        "guard_reversals": audit["guard_reversal_count"],
+        "tokenization": token_audit,
+        "split_provenance": {
+            "names": LEXICAL_NAMES,
+            "train_sentence_slots": [0, 1, 2, 3],
+            "development_sentence_slots": [4, 5],
+            "test_use": False,
+            "reserved_data": (
+                "Existing development and test files were not read or changed"
+            ),
+        },
+        "simulator_version": SIMULATOR_VERSION,
+        "limitations": [
+            (
+                "Counterfactual prior outcomes are simulated, not real model "
+                "rollouts or DAgger"
+            ),
+            (
+                "Micro-conversations use oracle actions and manual edits; "
+                "current-state replay is not live model accuracy"
+            ),
+            (
+                "Geometry uses the existing simulator; pixel fitting, "
+                "group/connection bounds and zoom-to-fit remain approximate"
+            ),
+        ],
+        "artifact_sha256": {
+            name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+            for name in (
+                "examples.jsonl",
+                "sessions.jsonl",
+                "counterfactual-setups.jsonl",
+                "contrastive-pairs.jsonl",
+                "data-audit.json",
+                "tokenization-audit.json",
+            )
+        },
+        "source_sha256": {
+            name: hashlib.sha256(
+                Path(__file__).with_name(name).read_bytes()
+            ).hexdigest()
+            for name in (
+                "build_workflow.py",
+                "actions.py",
+                "sessions.py",
+                "dataset.py",
+                "lab.py",
+            )
+        },
+    }
+    (output / "dataset-summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate general canvas instruction and editing-session data."
@@ -3973,8 +5144,18 @@ def main():
     parser.add_argument("--spoken-refinement", type=int, default=0)
     parser.add_argument("--accuracy-refinement", type=int, default=0)
     parser.add_argument("--quality-supplement", action="store_true")
+    parser.add_argument("--lexical-refinement", action="store_true")
     parser.add_argument("--practice-sessions", type=int, default=800)
     args = parser.parse_args()
+    if args.lexical_refinement:
+        if (
+            args.quality_supplement
+            or args.accuracy_refinement
+            or args.spoken_refinement
+        ):
+            parser.error("Use one refinement mode at a time.")
+        build_lexical_refinement(args.output, seed=args.seed)
+        return
     if args.quality_supplement:
         if args.accuracy_refinement or args.spoken_refinement:
             parser.error("Use one refinement mode at a time.")
